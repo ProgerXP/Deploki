@@ -3,10 +3,10 @@ chdir(dirname(__FILE__));
 
 require_once 'deploki.php';
 Deploki::prepareEnvironment();
-$options = DeplokiOptions::loadFrom(Deploki::locateConfig());
+$config = DeplokiConfig::loadFrom(Deploki::locateConfig());
 
-$canDebug = $options->debug;
-$options->debug &= empty($_REQUEST['stage']);
+$canDebug = $config->debug;
+$config->debug &= empty($_REQUEST['stage']);
 
 if ($patch = &$_FILES['patch'] and $patch['error'] != 4) {
   if !class_exists('ZipArchive')) {
@@ -18,8 +18,8 @@ if ($patch = &$_FILES['patch'] and $patch['error'] != 4) {
     Deploki::fail('Cannot read uploaded patch as ZIP.');
   }
 
-  $dest = $options->debug ? 'patch' : $options->outPath;
-  $options->mkdir($dest);
+  $dest = $config->debug ? 'patch' : $config->outPath;
+  $config->mkdir($dest);
 
   $zip->extractTo($dest) or Deploki::fail('ZipArchive->extractTo() has failed.');
   $url = '.?'.$_SERVER['QUERY_STRING'].'&patched='.$zip->numFiles;
@@ -36,8 +36,8 @@ if (@$_POST['perform'] === 'ret') {
 }
 
 if (!empty($_REQUEST['perform'])) {
-  $deploki = new Deploki($options);
-  $deploki->deploy($options->pages);
+  $deploki = new Deploki($config);
+  $deploki->deploy($config->pages);
 
   if ($_REQUEST['perform'] != 'ret') {
     $url = ltrim($_REQUEST['perform'], '0..9') === '' ? '..' : $_REQUEST['perform'];
@@ -48,9 +48,9 @@ if (!empty($_REQUEST['perform'])) {
 
 $patched = &$_REQUEST['patched'];
 
-$interface = DeplokiChain::make($options, array(
-  'read' => $options->absolute('_deploy.html', $options->dkiPath),
-  'htmlki' => array('vars' => get_defined_vars() + $options->vars()),
+$interface = DeplokiChain::make($config, array(
+  'read' => $config->absolute('_deploy.html', $config->dkiPath),
+  'htmlki' => array('vars' => get_defined_vars() + $config->vars()),
 ));
 
 echo join($interface->execute()->data);
