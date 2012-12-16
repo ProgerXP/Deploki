@@ -1,0 +1,79 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+  <head>
+    <title>Deploki { $app ? "— $app" : '' }</title>
+    <meta content="text/html; charset=utf-8" http-equiv="Content-Type" />
+
+    <style>
+      body {{ background: #eee; }
+      body, button {{ font-family: "Trebuchet MS", sans-serif; }
+      body *:last-child {{ margin-bottom: 0; }
+      body > table {{ height: 100%; width: 500px; margin: 0 auto; }
+      #inner {{ border: 3px dashed #ccc; background: #f7f7f7; padding: 2em; border-radius: 10px; }
+      h1 {{ margin: 0 0 1em; font-family: Georgia; text-align: center; }
+      a {{ color: navy; text-decoration: none; }
+      a:hover {{ color: maroon; }
+      p {{ margin: 1.2em 0; }
+      body.idle p.deploy button:first-child,
+        body.ret p.deploy button + button {{ font-weight: bold; }
+      button {
+        cursor: pointer;
+        border: 1px solid #999;
+        border-radius: 3px;
+        font-size: 1em;
+        background: -moz-linear-gradient(top, #fff 0%, #efefef 100%);
+        background: linear-gradient(to bottom, #fff 0%, #efefef 100%);
+      }
+      button:hover:not([disabled]) {{ background: white; border: 1px solid silver; }
+      button[disabled] {{ background: #eee; border: 1px solid silver; color: gray; }
+      label {{ margin-left: 1em; }
+      span.patched {{ margin-left: 2em; font-weight: bold; }
+    </style>
+  </head>
+  <body class={ empty($_REQUEST['perform']) ? 'idle' : 'ret' }>
+    <table/tr/td>
+      <div id=inner>
+        <h1>
+          <if $app>
+            Deploying <a "..">$app</a>
+          <else>
+            <a "..">Deplo<b>ki</b></a>
+          </if>
+        </h1>
+
+        <form "." file onsubmit="setTimeout(toggleBtn, 50)">
+          <p "zip">
+            Extract this ZIP (optional): <input "patch" file>
+          </p>
+
+          <p "deploy">
+            <submit "perform">Deploy</submit>
+            <submit "perform" value=ret>and return</submit>
+
+            <label>
+              <checkbox "stage" value=1 checked={ !$debug } disabled={ !$canDebug }>
+              <b>Stage</b> (as if in production)
+            </label>
+          </p>
+
+          <p "patch">
+            <submit>No, just patch & return here</submit>
+
+            <span $patched "patched">
+              Extracted $item files.
+            </endspan>
+          </p>
+        </form>
+      </div>
+    </td/tr/table>
+
+    <script>
+      function toggleBtn(enable) {
+        var btns = document.getElementsByTagName('button');
+        for (var btn in btns) {{ btns[btn].disabled = !enable; }
+      }
+
+      toggleBtn(true);
+    </script>
+  </body>
+</html>

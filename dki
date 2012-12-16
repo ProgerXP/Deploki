@@ -1,0 +1,7 @@
+#!/usr/bin/env php
+<?php
+defined('STDIN') or die('This script is meant to be ran from the shell.');
+require_once dirname(__FILE__).'/deploki.php';
+
+$deploki = new Deploki($options);
+$deploki->deploy($options->pages);
