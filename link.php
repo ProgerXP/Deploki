@@ -2,7 +2,12 @@
 $oldWD = getcwd();
 chdir(dirname(__FILE__));
 
-require_once 'deploki.php';
+$self = __FILE__;
+if (function_exists('readlink')) {
+  while ($target = readlink($self)) { $self = $target; }
+}
+
+require_once dirname($self).'/deploki.php';
 Deploki::prepareEnvironment();
 $config = DeplokiConfig::loadFrom(DeplokiConfig::locate($oldWD));
 

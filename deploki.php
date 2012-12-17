@@ -737,14 +737,18 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
   public $rendererConfig;   //= null, object filter-dependent - see configure()
   protected $currentLang;   //= null, str e.g. 'en', set by render()
 
+  protected function initialize($config) {
+    parent::initialize($config);
+    $this->defaults += array('libPath' => $this->libPath);
+  }
+
   //= bool indicating if the external framework (if any) is loaded; see load()
   abstract function isLoaded();
 
   // Loads external framework (e.g. HTMLki) if this filter depends on it.
   function load() {
     if (!$this->isLoaded()) {
-      $file = $this->config->libPath;
-      $file or $file = $this->name.'.php';
+      $file = $this->config->libPath ? $this->config->libPath : $this->name.'.php';
       $file = $this->config->absolute($file, $this->config->dkiPath);
 
       include_once $file;
@@ -770,7 +774,7 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
   //* $data string - file name or data ('fromData' bool option) to transform.
   //= string transformed data
   //= hash 'suffix' => 'data' - multiple new data (e.g. per language)replacing old
-  function render($data) {
+  function render($data, $src = null) {
     $result = array();
     $media = $this->config->withMedia ? $this->config->mediaVars() : array();
 
@@ -783,7 +787,7 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
     $languages or $this->warn('is given an empty language list to render into');
 
     foreach ($languages as $language) {
-      $vars = $this->config->vars + compact('languages', 'language') +
+      $vars = $this->config->vars + compact('languages', 'language', 'src') +
               $media + $this->config->vars();
 
       $rendered = $this->doRender($vars, $data);
@@ -820,7 +824,7 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
     $datas = $chain->data;
 
     foreach ($datas as $key => &$data) {
-      $rendered = $this->render($data);
+      $rendered = $this->render($data, $key);
 
       if (is_array($rendered)) {
         $chain->removeData($key);
@@ -1014,9 +1018,34 @@ class DkiMinify extends DeplokiFilter {
                   " [{$chain->name}], e.g. as in 'libs.js'");
     }
 
-    foreach ($chain->data as &$data) {
-      $data = join(DeplokiChain::execGetData($config, "minify$ext", $chain->name));
+    foreach ($chain->data as $key => &$data) {
+      $minifier = DeplokiChain::make($config, "minify$ext", $chain->name);
+      $minifier->data[$key] = $data;
+      $data = join($minifier->execute()->data);
     }
+  }
+}
+
+// Minifies CSS code.
+class DkiMinifycss extends DeplokiFilter {
+  protected function doExecute($chain, $config) {
+    foreach ($chain->data as &$data) { $data = $this->minify($data, $config); }
+  }
+
+  // From http://proger.i-forge.net/CSS_enchant-minification_layer_for_PHP/OSq.
+  function minify($css, DeplokiConfig $config) {
+    $css = preg_replace('~\s+~', ' ', $css);
+
+    if (preg_last_error() != 0) {
+      $this->fail('can\'t run preg_replace() - make sure that CSS is encoded in UTF-8');
+    }
+
+    $hex = '([a-zA-Z0-9])';
+    $path = '[a-zA-Z0-9_\-.\#,*>+\s\[\]=\~\|:\(\)]';
+    $regexp = '/\*.*?\*/ | '.$path.'{1,50} \s*\{\s*}\s* | \s*([;:{,}])\s+ | ;\s*(})\s* | '.
+              "\\b(?<!-)0(\.\d) | (\#) $hex\\5$hex\\6$hex\\7 | \s+([+>,])\s+";
+
+    return trim(preg_replace("~$regexp~x", '\1\2\3\4\5\6\7\8', $css));
   }
 }
 
@@ -1275,5 +1304,31 @@ class DkiUwiki extends DeplokiRenderingFilter {
     $doc->Parse();
 
     return $doc->ToHTML();
+  }
+}
+
+// Transforms LESS stylesheet sinto regular CSS. Depends on http://leafo.net/lessphp.
+class DkiLess extends DeplokiRenderingFilter {
+  public $libPath = 'lessc.inc.php';
+
+  function isLoaded() {
+    return class_exists('lessc');
+  }
+
+  protected function doConfigure($lessc = null) {
+    return $lessc ? $lessc : (new lessc);
+  }
+
+  protected function doRender(array $vars, $data) {
+    $this->config->fromData or $data = $this->config->readFile($data);
+
+    $this->rendererConfig->setImportDir($this->config->inPath);
+    isset($vars['src']) and $this->rendererConfig->setImportDir(dirname($vars['src']));
+
+    try {
+      return $this->rendererConfig->compile($data);
+    } catch (Exception $ex) {
+      $this->fail("cannot compile [$data]");
+    }
   }
 }
