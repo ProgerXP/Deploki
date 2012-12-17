@@ -15,6 +15,10 @@ function dkiIsAbs($path) {
          (strpbrk($path[0], '\\/') !== false  or strpos($path, ':') !== false);
 }
 
+function dkiGet($array, $key, $default = null) {
+  return (is_array($array) and isset($array[$key])) ? $array[$key] : $default;
+}
+
 class DeplokiError extends Exception { }
 
 class DeplokiFilterError extends Exception {
@@ -124,7 +128,7 @@ class DeplokiConfig {
 
   // Does not reset $secret.
   function defaults($inPath = null) {
-    $this->debug          = @$_SERVER['REMOTE_ADDR'] === '127.0.0.1';
+    $this->debug          = dkiGet($_SERVER, 'REMOTE_ADDR') === '127.0.0.1';
     $this->app            = null;
 
     $this->dkiPath        = dirname(__FILE__);
@@ -133,7 +137,7 @@ class DeplokiConfig {
     $this->media          = array();
 
     $this->urls           = array(
-      'outPath'           => dirname($_SERVER['REQUEST_URI']),
+      'outPath'           => dirname(dkiGet($_SERVER, 'REQUEST_URI')),
     );
 
     $this->dirPerms       = 0755;
@@ -343,9 +347,9 @@ class DeplokiConfig {
   //= string translated & formatted
   //= array if no $format is given and $str points to an array or is omitted
   function langLine($lang, $str = null, array $format = array()) {
-    $lines = &self::$langLines[$lang];
+    $lines = dkiGet(self::$langLines, $lang);
     isset($lines) or $lines = (include $this->absolute("$lang.php", $this->inPath));
-    $line = isset($str) ? @$lines[$str] : $lines;
+    $line = isset($str) ? dkiGet($lines, $str) : $lines;
 
     if (is_array($line)) {
       if (func_num_args() < 2) {
@@ -401,7 +405,8 @@ class Deploki {
             break;
           } elseif ($argValue = ltrim($arg, '-')) {
             if ($arg[1] == '-') {
-              @list($key, $value) = explode('=', $argValue, 2);
+              strrchr($argValue, '=') === false and $argValue .= '=';
+              list($key, $value) = explode('=', $argValue, 2);
               $key = strtolower($key);
               isset($value) or $value = true;
 
@@ -457,7 +462,7 @@ class Deploki {
       );
     }
 
-    if (defined('STDIN')) {
+    if (defined('STDIN' or !empty($_SERVER['TERM']))) {
       echo join(PHP_EOL, array_map('strip_tags', $msg)), PHP_EOL;
     } else {
       echo join("\n", $msg);
@@ -605,7 +610,7 @@ class DeplokiChain {
 
         $filter = $baseConfig->filter($filter);
 
-        $perFilter = &$baseConfig->perFilter[$filter->name];
+        $perFilter = dkiGet($baseConfig->perFilter, $filter->name);
         $options = $filter->expandOptions($options) + ((array) $perFilter);
 
         $filter->config->override($filter->normalize($options));
@@ -840,7 +845,7 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
 
   // Lightweight HTML minification - collapses successive whitespace into one.
   function compact($html) {
-    $html = preg_replace('/(\s)\s*/u', '\\1', $html);
+    $html = preg_replace('/\s*(\n)\s*|(\s)\s+/u', '\1\2', $html);
     return $html;
   }
 }
@@ -908,7 +913,7 @@ class DkiWrite extends DeplokiFilter {
 
   function write($dest, $data, array $vars) {
     $this->config->writeFile($dest, $data);
-    $this->chain->urls[$src] = $this->urlOf($dest, $vars);
+    $this->chain->urls[$vars['src']] = $this->urlOf($dest, $vars);
   }
 
   function urlOf($file, array $vars) {
@@ -943,13 +948,17 @@ class DkiConcat extends DeplokiFilter {
                            'cutTitle' => false);
   public $shortOption = 'chains';
 
+  // Private fields for cutHeading() to overcome the absense of PHP 5.3 closures.
+  protected $hcHeading;
+  protected $hcReplace;
+
   protected function doExecute($chain, $config) {
     if ($chain->data) {
       if ($config->chains) {
         $this->concatWith($config->chains, $chain->data);
       } else {
         $glue = $this->expand($config->glue);
-        $chain->data = array(join($glue, $chain->data));
+        $chain->data = array('concat' => join($glue, $chain->data));
       }
     }
   }
@@ -997,16 +1006,18 @@ class DkiConcat extends DeplokiFilter {
   }
 
   //= null if $html has no <hX> tag, array ('<hX>title...</hX>', 'hX', 'title...')
-  static function cutHeading(&$html, $replace = '') {
+  function cutHeading(&$html, $replace = '') {
+    $this->hcHeading = null;
+    $this->hcReplace = $replace;
+
     $regexp = '~<(h[1-6])\b[^>]*>(.*?)</\1>~us';
-    $heading = null;
+    $html = preg_replace_callback($regexp, array($this, 'headingCutter'), $html, 1);
+    return $this->hcHeading;
+  }
 
-    $html = preg_replace_callback($regexp, function ($match) use (&$heading, $replace) {
-      $heading = $match;
-      return $replace === null ? $match[0] : $replace;
-    }, $html, 1);
-
-    return $heading;
+  function headingCutter($match) {
+    $this->hcHeading = $match;
+    return $this->hcReplace === null ? $match[0] : $this->hcReplace;
   }
 }
 
@@ -1138,7 +1149,7 @@ class DkiLink extends DeplokiFilter {
       }
 
       $url = $this->config->urlOf($linker);
-      $chain->urls['linked'] = $url.'?'.join('&', $query).'&'.$config->query;
+      $chain->urls['link'] = $url.'?'.join('&', $query).'&'.$config->query;
     }
   }
 }
@@ -1160,6 +1171,7 @@ class DkiVersion extends DeplokiFilter {
 
         $ver = &$versions[$key]['version'];
         if ($ver <= 0 or $versions[$key]['md5'] !== $hash) {
+          $versions[$key]['md5'] = $hash;
           $hasObsolete = true;
           ++$ver;
         }
@@ -1188,7 +1200,7 @@ class DkiHtmlki extends DeplokiRenderingFilter {
   }
 
   //* $kiCfg HTMLkiConfig
-  protected function doConfigure($kiCfg = null) {
+  protected function doConfigure($kiCfg) {
     $kiCfg or $kiCfg = HTMLki::config();
     ($kiCfg instanceof HTMLkiConfig) or $this->fail('received $kiCfg of wrong type');
 
@@ -1238,7 +1250,7 @@ class DkiHtmlki extends DeplokiRenderingFilter {
 
     if ($file and !is_file($file)) {
       $this->fail("cannot find template file [$file]");
-    } elseif (!is_file($cache) and (!$file or filemtime($cache) < filemtime($file))) {
+    } elseif (!is_file($cache) or !$file or filemtime($cache) < filemtime($file)) {
       $compiled = HTMLki::compile($data, $kiCfg);
       $this->config->writeFile($cache, $compiled);
       $tpl = HTMLki::template($compiled, $kiCfg);
@@ -1266,7 +1278,7 @@ class DkiUwiki extends DeplokiRenderingFilter {
     return class_exists('UWikiDocument');
   }
 
-  protected function doConfigure($uwCfg = null) {
+  protected function doConfigure($uwCfg) {
     $uwCfg or $uwCfg = new UWikiSettings;
     ($uwCfg instanceof UWikiSettings) or $this->fail('received $uwCfg of wrong type');
 
@@ -1315,7 +1327,7 @@ class DkiLess extends DeplokiRenderingFilter {
     return class_exists('lessc');
   }
 
-  protected function doConfigure($lessc = null) {
+  protected function doConfigure($lessc) {
     return $lessc ? $lessc : (new lessc);
   }
 

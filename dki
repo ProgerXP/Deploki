@@ -1,6 +1,8 @@
 #!/usr/bin/env php
 <?php
-defined('STDIN') or die('This script is meant for running from the shell.');
+if (!defined('STDIN') and empty($_SERVER['TERM'])) {
+  die('This script is meant for running from the shell.');
+}
 
 require_once dirname(__FILE__).'/deploki.php';
 Deploki::prepareEnvironment();
