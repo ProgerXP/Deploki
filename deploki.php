@@ -885,6 +885,7 @@ class DkiWrite extends DeplokiFilter {
   protected function doExecute($chain, $config) {
     foreach ($chain->data as $src => &$data) {
       $vars = array(
+        'src'             => $src,
         'path'            => dirname($src),
         'ext'             => $ext = ltrim(strrchr(basename($src), '.'), '.'),
         'file'            => basename($src, ".$ext"),
@@ -897,10 +898,13 @@ class DkiWrite extends DeplokiFilter {
       }
 
       $dest = $config->absolute($dest, $config->mediaPath);
-      $config->writeFile($dest, $data);
-
-      $chain->urls[$src] = $this->urlOf($dest, $vars);
+      $this->write($dest, $data, $vars);
     }
+  }
+
+  function write($dest, $data, array $vars) {
+    $this->config->writeFile($dest, $data);
+    $this->chain->urls[$src] = $this->urlOf($dest, $vars);
   }
 
   function urlOf($file, array $vars) {
@@ -913,6 +917,16 @@ class DkiWrite extends DeplokiFilter {
     } else {
       return $this->config->urlOf($file);
     }
+  }
+}
+
+// Removes already up-to-date files from the chain.
+class DkiOmitold extends DkiWrite {
+  public $shortOption = 'dest';
+
+  function write($dest, $data, array $vars) {
+    $old = (is_file($dest) and filemtime($dest) >= filemtime($vars['src']));
+    $old and $this->chain->removeData($vars['src']);
   }
 }
 
