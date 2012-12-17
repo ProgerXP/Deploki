@@ -93,8 +93,9 @@ class DeplokiConfig {
     return $config->override(get_defined_vars());
   }
 
+  //* $default string becomes array, array, null - value to return on empty result.
   //= array ('ru', 'en')
-  static function detectLanguagesIn($path) {
+  static function detectLanguagesIn($path, $default = 'en') {
     $languages = array();
 
     if (is_dir($path)) {
@@ -105,6 +106,7 @@ class DeplokiConfig {
       }
     }
 
+    $languages or $languages = (array) $default;
     return $languages;
   }
 
@@ -277,7 +279,7 @@ class DeplokiConfig {
   function hash($str) {
     if (strlen($this->secret) < 32) {
       // 32 chars in case we need it for mcrypt's IV in future.
-      Deploki::fail('The $secret setting must be set to at least 32-character string.');
+      Deploki::fail('The $secret option must be set to at least 32-character string.');
     } else {
       return md5($this->secret.'-'.$str);
     }
@@ -314,7 +316,7 @@ class DeplokiConfig {
 
   //= hash 'js' => array('media/all/libs.js', ...)
   function mediaVars() {
-    if (! $this->media instanceof DeplokiChain) {
+    if (! $this->media instanceof DeplokiBatch) {
       $batchConfig = clone $this;
       $batchConfig->media = array();   // to avoid recursion.
       $this->media = new DeplokiBatch($batchConfig, $this->media);
@@ -380,7 +382,7 @@ class Deploki {
   }
 
   static function warn($msg) {
-    trigger_error("Deploki: $msg.", E_USER_WARNING);
+    trigger_error("Deploki: $msg", E_USER_WARNING);
   }
 
   // From http://proger.i-forge.net/Various_format_parsing_functions_for_PHP/ein
@@ -604,7 +606,7 @@ class DeplokiChain {
         $filter = $baseConfig->filter($filter);
 
         $perFilter = &$baseConfig->perFilter[$filter->name];
-        $options += (array) $perFilter;
+        $options = $filter->expandOptions($options) + ((array) $perFilter);
 
         $filter->config->override($filter->normalize($options));
         $options = $filter;
@@ -666,12 +668,15 @@ abstract class DeplokiFilter {
       $this->fail("options [$same] have the same name as global options");
     }
 
-    is_array($config) or $config = (array) $this->expandOptions($config);
-    return $config + $this->defaults + array($this->shortOption => null);
+    return $this->expandOptions($config) + $this->defaults +
+           array($this->shortOption => null);
   }
 
+  //= hash always
   function expandOptions($option) {
-    if (isset($this->shortOption)) {
+    if (is_array($option)) {
+      return $option;
+    } elseif (isset($this->shortOption)) {
       return array($this->shortOption => $option);
     } else {
       $this->fail('doesn\'t support short option');
@@ -740,7 +745,7 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
     if (!$this->isLoaded()) {
       $file = $this->config->libPath;
       $file or $file = $this->name.'.php';
-      $file = $this->absolute($file, $this->config->dkiPath);
+      $file = $this->config->absolute($file, $this->config->dkiPath);
 
       include_once $file;
       $this->isLoaded() or $this->fail("cannot load the library from [$file]");
@@ -774,7 +779,10 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
       $languages = $languages ? $this->config->languages : array(null);
     }
 
-    foreach ((array) $languages as $language) {
+    $languages = (array) $languages;
+    $languages or $this->warn('is given an empty language list to render into');
+
+    foreach ($languages as $language) {
       $vars = $this->config->vars + compact('languages', 'language') +
               $media + $this->config->vars();
 
@@ -837,19 +845,32 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
 | STANDARD FILTERS
 |----------------------------------------------------------------------*/
 
+// Puts input as it is into the chain's data.
+class DkiRaw extends DeplokiFilter {
+  public $shortOption = 'data';
+
+  protected function doExecute($chain, $config) {
+    $chain->data = (array) $config->data + $chain->data;
+  }
+}
+
 // Reads listed file paths into their contents.
 class DkiRead extends DeplokiFilter {
   public $shortOption = 'masks';
 
   protected function doExecute($chain, $config) {
+    $files = array();
+
     foreach ((array) $config->masks as $mask) {
       $path = $config->absolute($mask, $config->outPath);
-      $files = glob($path, GLOB_NOESCAPE | GLOB_BRACE);
+      $files = array_merge($files, glob($path, GLOB_NOESCAPE | GLOB_BRACE));
+    }
 
-      // note that all items in $files exist thanks to glob().
-      foreach ($files as $path) {
-        $chain->data[$path] = $this->config->readFile($path);
-      }
+    $files = array_unique($files);
+
+    // note that all items in $files exist thanks to glob().
+    foreach ($files as $path) {
+      $chain->data[$path] = $this->config->readFile($path);
     }
   }
 }
@@ -897,7 +918,11 @@ class DkiWrite extends DeplokiFilter {
 
 // Joins current data or wraps it in given chains, if passed.
 class DkiConcat extends DeplokiFilter {
-  public $defaults = array('glue' => "\n", 'cacheChain' => false, 'cutHeading' => false);
+  // 'title' can be null (detect <hX> in data) or an (empty) string (title).
+  // If 'cutTitle' is true <hX>...</hX> will be removed from the data. If it's
+  // false/null it's be kept. If it's a string it's replaced with that string instead.
+  public $defaults = array('glue' => "\n", 'cacheChain' => false, 'title' => null,
+                           'cutTitle' => false);
   public $shortOption = 'chains';
 
   protected function doExecute($chain, $config) {
@@ -915,7 +940,7 @@ class DkiConcat extends DeplokiFilter {
     foreach ($current as &$data) {
       $merged = '';
       $cached = array();
-      $title = null;
+      $title = $this->config->title;
 
       foreach ((array) $chains as $name => $chain) {
         if ($chain === null) {
@@ -929,12 +954,18 @@ class DkiConcat extends DeplokiFilter {
             $chainConfig = clone $chainConfig;
 
             if (!isset($title)) {
-              $replace = $this->config->cutHeading ? '' : null;
+              $replace = $this->config->cutTitle ? '' : null;
               $title = $this->cutHeading($data, $replace);
               $title = $title ? strip_tags(trim($title[2])) : '';
             }
 
-            $chainConfig->media += array('body' => $data, 'title' => $title);
+            $vars = array('body' => $data, 'title' => $title);
+
+            foreach ($vars as $name => &$value) {
+              if (!isset($chainConfig->media[$name])) {
+                $chainConfig->media[$name] = array('raw' => $value);
+              }
+            }
           }
 
           $result = join(DeplokiChain::execGetData($chainConfig, $chain, $name));
@@ -1012,14 +1043,14 @@ class DkiKeep extends DeplokiFilter {
       $check = array_filter($check, $mask);
     } else {
       $mask = $this->expand($mask);
-      $isWildcard = strpbrk($mask, '?*') !== false;
+      $isRegExp = $mask[0] === '~';
+      $isWildcard = (!$isRegExp and strpbrk($mask, '?*') !== false);
 
       if ($isWildcard) {
         $mask = '~^'.preg_quote($mask, '~').'$~i';
         $mask = strtr($mask, array('\\?' => '.', '\\*' => '.*?'));
+        $isRegExp = true;
       }
-
-      $isRegExp = $mask[0] === '~';
 
       foreach (array_keys($check) as $key) {
         $value = $isWildcard ? basename($key) : dkiPath($key);
@@ -1042,6 +1073,10 @@ class DkiOmit extends DkiKeep {
 
 // Converts list of file paths into one URL - useful to avoid redeploying on debug.
 class DkiLink extends DeplokiFilter {
+  // 'query' can contain 'mime=image/jpeg' and 'charset=cp1251'.
+  public $defaults = array('query' => '');
+  public $shortOption = 'linker';
+
   protected function doExecute($chain, $config) {
     $query = array();
 
@@ -1053,9 +1088,14 @@ class DkiLink extends DeplokiFilter {
     if ($query) {
       $query[] = 'hash='.$config->hash(join('|', $query));
 
-      $linker = $this->config->absolute('link.php', $this->config->dkiPath);
+      if ($linker = $config->linker) {
+        $linker = $this->config->absolute($linker, $this->config->inPath);
+      } else {
+        $linker = $this->config->absolute('link.php', $this->config->dkiPath);
+      }
+
       $url = $this->config->urlOf($linker);
-      $chain->urls['linked'] = $url.'?'.join('&', $query);
+      $chain->urls['linked'] = $url.'?'.join('&', $query).'&'.$config->query;
     }
   }
 }
@@ -1136,7 +1176,7 @@ class DkiHtmlki extends DeplokiRenderingFilter {
 
   protected function doRender(array $vars, $data) {
     if ($this->config->fromData) {
-      $tpl = HTMLki::template(HTMLki::compile($data), $this->rendererConfig);
+      $tpl = $this->templateFromData($data, $this->rendererConfig);
     } else {
       $tpl = $this->template($data, $this->rendererConfig);
     }
@@ -1145,13 +1185,18 @@ class DkiHtmlki extends DeplokiRenderingFilter {
   }
 
   function template($file, HTMLkiConfig $kiCfg) {
-    $base = basename($file, '.html').'-'.md5($file).'.php';
+    return $this->templateFromData($this->config->readFile($file), $kiCfg, $file);
+  }
+
+  function templateFromData($data, HTMLkiConfig $kiCfg, $file = null) {
+    $base = $file ? basename($file, '.html').'-' : '';
+    $base .= md5($data).'.php';
     $cache = $this->config->absolute("htmlki/$base", $this->config->tempPath);
 
-    if (!is_file($file)) {
+    if ($file and !is_file($file)) {
       $this->fail("cannot find template file [$file]");
-    } elseif (!is_file($cache) or filemtime($cache) < filemtime($file)) {
-      $compiled = HTMLki::compileFile($file, $kiCfg);
+    } elseif (!is_file($cache) and (!$file or filemtime($cache) < filemtime($file))) {
+      $compiled = HTMLki::compile($data, $kiCfg);
       $this->config->writeFile($cache, $compiled);
       $tpl = HTMLki::template($compiled, $kiCfg);
     } else {
@@ -1183,7 +1228,7 @@ class DkiUwiki extends DeplokiRenderingFilter {
     ($uwCfg instanceof UWikiSettings) or $this->fail('received $uwCfg of wrong type');
 
     $uwCfg->enableHTML5 = !$this->config->xhtml;
-    $uwCfg->rootURL = $this->config->urlOf($this->config->outPath);
+    $uwCfg->rootURL = rtrim($this->config->urlOf($this->config->outPath), '/').'/';
     $uwCfg->pager = new UWikiFilePager($this->config->inPath);
     $uwCfg->pager->nameConvertor = array($this, 'nameConvertor');
 
@@ -1209,7 +1254,8 @@ class DkiUwiki extends DeplokiRenderingFilter {
   protected function doRender(array $vars, $data) {
     $this->config->fromData or $data = $this->config->readFile($data);
 
-    $doc = new UWikiDocument($data, $this->rendererConfig);
+    $doc = new UWikiDocument($data);
+    $doc->settings = $this->rendererConfig;
     $markup = $this->config->markup === 'wiki' ? 'wacko' : $this->config->markup;
     $doc->LoadMarkup($markup);
     $doc->Parse();

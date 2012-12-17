@@ -6,7 +6,7 @@ require_once dirname(__FILE__).'/deploki.php';
 Deploki::prepareEnvironment();
 
 $arrays = array();
-foreach (ArrayObject(new DeplokiConfig) as $option => $value) {
+foreach ((array) new DeplokiConfig as $option => $value) {
   is_array($value) and $arrays[] = $option;
 }
 
@@ -16,6 +16,7 @@ extract(Deploki::parseCL($argv, $arrays));
 
 $config = $index ? $index[0] : getcwd();
 $config = DeplokiConfig::loadFrom(DeplokiConfig::locate($config));
+isset($flags['d']) and $options += array('debug' => true);
 
 foreach ($options as $option => $value) {
   if (strrchr($option, '-') !== false) {
@@ -24,11 +25,11 @@ foreach ($options as $option => $value) {
     $option .= 'Path';
   }
 
-  $config->$option = is_array($value) ? ($value + $config->$option) : $value
+  $config->$option = is_array($value) ? ($value + $config->$option) : $value;
 }
 
 $deploki = new Deploki($config);
-empty($flags['d']) or debugBreak();
+isset($flags['b']) and debugBreak();
 $deploki->deploy($config->pages);
 
-echo 'Done.';
+echo "Deployed to [{$config->outPath}].";

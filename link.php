@@ -1,16 +1,29 @@
 <?php
+$oldWD = getcwd();
 chdir(dirname(__FILE__));
 
 require_once 'deploki.php';
 Deploki::prepareEnvironment();
-$options = DeplokiOptions::loadFrom(Deploki::locateConfig());
+$config = DeplokiConfig::loadFrom(DeplokiConfig::locate($oldWD));
 
-$files = array();
-foreach ($_GET as $key => $file) { is_int($key) and $files[] = $file; }
+$hash = $files = array();
 
-if ($options->hash(join('|', $files)) !== $_GET['hash']) {
-  Deploki::fail('Wrong hash for thiscombination of files to read.');
+foreach ($_GET as $key => $file) {
+  if (is_int($key)) {
+    $files[] = $file;
+    $hash[] = "$key=".urlencode($file);
+  }
 }
+
+if ($config->hash(join('|', $hash)) !== $_GET['hash']) {
+  Deploki::fail('Wrong hash for this combination of files to read.');
+}
+
+$mimes = array('.css' => 'text/css', '.js' => 'text/javascript');
+$mime = @$_GET['mime'];
+$mime or $mime = $mimes[ strrchr($files[0], '.') ];
+$charset = @$_GET['charset'] ? $_GET['charset'] : 'utf-8';
+$mime and header("Content-Type: $mime; charset=$charset");
 
 foreach ($files as $file) {
   readfile($file);
