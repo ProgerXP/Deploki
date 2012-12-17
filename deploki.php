@@ -6,6 +6,15 @@
   Supports PHP 5.2+
 */
 
+function dkiPath($path) {
+  return rtrim(strtr($path, '\\', '/'), '/');
+}
+
+function dkiIsAbs($path) {
+  return ($path = trim($path)) !== '' and
+         (strpbrk($path[0], '\\/') !== false  or strpos($path, ':') !== false);
+}
+
 class DeplokiError extends Exception { }
 
 class DeplokiFilterError extends Exception {
@@ -36,8 +45,6 @@ class DeplokiConfig {
 
   public $languages;    //= array of string like 'ru'
   public $media;        //= hash 'name.ext' => array(chains)
-  public $reuseMedia;   //= true process media chains once, false redo them on each page
-  protected $cachedMedia; //= null, hash used if $reuseMedia is true
 
   // Local file -> URL mappsings. Entries here are checked in top-down order so
   // include more specific paths (e.g. $tempPath) before parents (e.g. $outPath).
@@ -51,7 +58,7 @@ class DeplokiConfig {
   public $dirPerms;     //= integer umask for newly created directories like 0777
   public $filePerms;    //= integer umask for newly created files like 0777
   public $viaAliases;   //= hash of string 'alias' => 'realVia'
-  public $libPaths;     //= hash of string path
+  public $perFilter;    //= hash of hash, hash of DeplokiConfig
 
   /*---------------------------------------------------------------------
   | FILTER-SPECIFIC
@@ -70,14 +77,35 @@ class DeplokiConfig {
     return array_key_exists($option, $keys);
   }
 
+  static function locate($path = null, $baseName = 'config.php') {
+    $path = dkiPath($path ? $path : dirname(__FILE__)).'/';
+    $file = $path.$baseName;
+    is_file($file) or $file = $path."in/$baseName";
+    is_file($file) or Deploki::fail("Cannot locate $baseName in [$path].");
+    return $file;
+  }
+
   static function loadFrom($_file) {
-    $isFlat = basename(dirname($_file)) !== 'in';
-    $config = self::make()->defaultsAt(dirname($_file), $isFlat);
-
+    $config = self::make()->defaultsAt(dirname($_file));
     extract($config->vars(), EXTR_SKIP);
-    require $_file;
 
+    require $_file;
     return $config->override(get_defined_vars());
+  }
+
+  //= array ('ru', 'en')
+  static function detectLanguagesIn($path) {
+    $languages = array();
+
+    if (is_dir($path)) {
+      foreach (scandir($path) as $lang) {
+        if (strrchr($lang, '.') === '.php' and strlen($lang) === 6) {
+          $languages[] = substr($lang, 0, 2);
+        }
+      }
+    }
+
+    return $languages;
   }
 
   static function make($override = array()) {
@@ -101,8 +129,6 @@ class DeplokiConfig {
     $this->defaultsAt($this->dkiPath.'/in');
 
     $this->media          = array();
-    $this->reuseMedia     = true;
-    $this->cachedMedia    = null;
 
     $this->urls           = array(
       'outPath'           => dirname($_SERVER['REQUEST_URI']),
@@ -117,37 +143,42 @@ class DeplokiConfig {
       'wiki'              => 'uwiki',
     );
 
+    $this->perFilter      = array();
+
     return $this;
   }
 
-  function defaultsAt($inPath, $flat = false) {
-    $inPath = rtrim($inPath, '\\/');
+  function defaultsAt($inPath, $outPath = null, $tempPath = null) {
+    $inPath = dkiPath($inPath);
+    $outPath = dkiPath($outPath);
+    $tempPath = dkiPath($tempPath);
+    $dkiPath = dkiPath(dirname(__FILE__));
 
-    $this->inPath         = $inPath;
-    $this->outPath        = $flat ? dirname($inPath) : dirname(dirname($inPath));
-    $this->tempPath       = $flat ? "$inPath/temp" : dirname($inPath).'/temp';
-    $this->mediaPath      = $this->outPath.'/media/all';
-
-    $this->languages      = $this->detectLanguagesIn($inPath);
-    return $this;
-  }
-
-  //= array ('ru', 'en')
-  function detectLanguagesIn($path) {
-    $languages = array();
-
-    foreach (scandir($path) as $lang) {
-      if (strrchr($lang, '.') === '.php' and strlen($lang) === 6) {
-        $languages[] = substr($lang, 0, 2);
-      }
+    if (!$outPath) {
+      // If in/ is located under Deploki's library root this typically corresponds to
+      // this structure: server_root/, root/deploy/, root/deploy/in, root/deploy/temp/.
+      // If not we'll assume it's one level inside the output dir (root/, root/in/).
+      $outPath = dirname($inPath) === $dkiPath ? dirname($dkiPath) : dirname($inPath);
     }
 
-    return $languages;
+    if (!$tempPath) {
+      // temp/ is typically always on the same dir level as in/ except when in/ and
+      // Deploki are located in the same place (root/deploy/, root/deploy/temp/).
+      $tempPath = $inPath === $outPath ? "$inPath/temp" : dirname($inPath).'/temp';
+    }
+
+    $this->inPath         = $inPath;
+    $this->outPath        = $outPath;
+    $this->tempPath       = $tempPath;
+    $this->mediaPath      = "$outPath/media/all";
+
+    $this->languages      = self::detectLanguagesIn($inPath);
+    return $this;
   }
 
   function override(array $override) {
     foreach ($override as $name => $value) {
-      $this->$name = $value;
+      "$name" !== '' and $this->$name = $value;
     }
 
     return $this;
@@ -162,14 +193,12 @@ class DeplokiConfig {
   |--------------------------------------------------------------------*/
 
   function absolute($path, $base) {
-    $path = trim($path);
-
-    if ($path === '') {
+    if (($path = trim($path)) === '') {
       return $base;
-    } elseif (strpbrk($path[0], '\\/') !== false  or strpos($path, ':') !== false) {
+    } elseif (dkiIsAbs($path)) {
       return $path;
     } else {
-      return rtrim($base, '\\/')."/$path";
+      return dkiPath($base)."/$path";
     }
   }
 
@@ -229,17 +258,16 @@ class DeplokiConfig {
   }
 
   function urlOf($file) {
-    $file = strtr( realpath($file) ? realpath($file) : $file, '\\', '/' );
+    $file = dkiPath(realpath($file) ? realpath($file) : $file);
     $mappings = array();
 
     foreach ($this->urls as $path => $url) {
-      strpbrk($path[0], '\\/') === false and $path = $this->$path;
-
-      $path = rtrim(strtr($path, '\\', '/'), '/').'/';
+      dkiIsAbs($path) or $path = $this->$path;
+      $path = dkiPath($path).'/';
       $mappings[] = "$path -> $url";
 
       if (substr("$file/", 0, $len = strlen($path)) === $path) {
-        return rtrim($url, '\\/').'/'.substr($file, $len);
+        return dkiPath($url).'/'.substr($file, $len);
       }
     }
 
@@ -286,28 +314,28 @@ class DeplokiConfig {
 
   //= hash 'js' => array('media/all/libs.js', ...)
   function mediaVars() {
-    if ($this->reuseMedia and isset($this->cachedMedia)) {
-      return $this->cachedMedia;
-    } else {
-      $result = array();
-
+    if (! $this->media instanceof DeplokiChain) {
       $batchConfig = clone $this;
       $batchConfig->media = array();   // to avoid recursion.
-      $batch = new DeplokiBatch($batchConfig);
-      $files = $batch->process($this->media);
+      $this->media = new DeplokiBatch($batchConfig, $this->media);
+      $this->media->cache = true;
+    }
 
-      foreach ($files as $name => $chain) {
-        $ext = ltrim(strrchr($name, '.'), '.');
-        $ext === '' and $ext = $name;
+    $result = array();
 
+    foreach ($this->media->process() as $name => $chain) {
+      $ext = ltrim(strrchr($name, '.'), '.');
+      $values = $chain->urls ? $chain->urls : $chain->data;
+
+      if ($ext === '') {
+        $result[$name] = join($values);
+      } else {
         isset($result[$ext]) or $result[$ext] = array();
-        $values = $chain->urls ? $chain->urls : $chain->data;
         $result[$ext] = array_merge($result[$ext], $values);
       }
-
-      $this->reuseMedia and $this->cachedMedia = $result;
-      return $result;
     }
+
+    return $result;
   }
 
   //= string translated & formatted
@@ -338,12 +366,6 @@ class DeplokiConfig {
     is_int($name) and ++$name;
     return "$$name";
   }
-
-  //= string absolute path
-  function libPath($lib, $default) {
-    isset($this->libPaths[$lib]) and $default = $this->libPaths[$lib];
-    return $this->config->absolute($default, $this->config->dkiPath);
-  }
 }
 
 /*-----------------------------------------------------------------------
@@ -361,12 +383,51 @@ class Deploki {
     trigger_error("Deploki: $msg.", E_USER_WARNING);
   }
 
-  static function locateConfig($baseName = 'config.php') {
-    $path = dirname(__FILE__).'/';
-    $file = $path.$baseName;
-    is_file($file) or $file = $path."in/$baseName";
-    is_file($file) or self::fail("Cannot locate $baseName.");
-    return $file;
+  // From http://proger.i-forge.net/Various_format_parsing_functions_for_PHP/ein
+  //* $args array - PHP's $argv, list of raw command-line options given by index.
+  //* $arrays array - listed keys will be always arrays in returned 'options'.
+  //= array with 3 arrays described above (flags, options, index)
+  function parseCL($args, $arrays = array()) {
+    $arrays = array_flip($arrays);
+    $flags = $options = $index = array();
+
+    foreach ($args as $i => &$arg) {
+      if ($arg !== '') {
+        if ($arg[0] == '-') {
+          if ($arg === '--') {
+            $index = array_merge($index, array_slice($args, $i + 1));
+            break;
+          } elseif ($argValue = ltrim($arg, '-')) {
+            if ($arg[1] == '-') {
+              @list($key, $value) = explode('=', $argValue, 2);
+              $key = strtolower($key);
+              isset($value) or $value = true;
+
+              if (preg_match('/^(.+)\[(.*)\]$/', $key, $matches)) {
+                list(, $key, $subKey) = $matches;
+              } else {
+                $subKey = null;
+              }
+
+              if ($subKey !== null and isset( $arrays[$key] )) {
+                $subKey === '' ? $options[$key][] = $value
+                               : $options[$key][$subKey] = $value;
+              } else {
+                isset( $arrays[$key] ) and $value = array($value);
+                $options[$key] = $value;
+              }
+            } else {
+              $flags += array_flip( str_split($argValue) );
+            }
+          }
+        } else {
+          $index[] = $arg;
+        }
+      }
+    }
+
+    $flags and $flags = array_combine(array_keys($flags), array_fill(0, count($flags), true));
+    return compact('flags', 'options', 'index');
   }
 
   static function prepareEnvironment() {
@@ -380,17 +441,26 @@ class Deploki {
 
   static function onException($e) {
     if ($e instanceof Exception) {
-      $msg = '<h2>'.preg_replace('/([a-z])([A-Z])/', '\1 \2', get_class($e)).'</h2>'.
-             'in <strong>'.htmlspecialchars($e->getFile().':'.$e->getLine()).'</strong>'.
-             '<pre>'.htmlspecialchars($e->getMessage()).'</pre>'.
-             '<hr>'.
-             '<pre>'.$e->getTraceAsString().'</pre>';
+      $msg = array(
+        '<h2>'.preg_replace('/([a-z])([A-Z])/', '\1 \2', get_class($e)).'</h2>',
+        'in <strong>'.htmlspecialchars($e->getFile().':'.$e->getLine()).'</strong>',
+        '<pre>'.htmlspecialchars($e->getMessage()).'</pre>',
+        '<hr>',
+        '<pre>'.$e->getTraceAsString().'</pre>',
+      );
     } else {
-      $msg = '<h2>Exception occurred</h2>'.
-             '<pre>'.htmlspecialchars(var_export($e, true)).'</pre>';
+      $msg = array(
+        '<h2>Exception occurred</h2>',
+        '<pre>'.htmlspecialchars(var_export($e, true)).'</pre>',
+      );
     }
 
-    echo $msg;
+    if (defined('STDIN')) {
+      echo join(PHP_EOL, array_map('strip_tags', $msg)), PHP_EOL;
+    } else {
+      echo join("\n", $msg);
+    }
+
     exit(1);
   }
 
@@ -420,15 +490,14 @@ class Deploki {
 
   function deploy(array $pages) {
     $this->prepare();
-    $batch = new DeplokiBatch($this->config);
-    return $batch->process($pages);
+    $batch = new DeplokiBatch($this->config, $pages);
+    return $batch->process();
   }
 
   function prepare() {
     foreach ((array) $this->config as $option => $value) {
-      if (substr($option, -4) === 'Path' and strpbrk($value[0], '\\/') === false
-          and strpos($value, ':') === false) {
-        $this->config->$option = rtrim(getcwd(), '\\/')."/$value";
+      if (substr($option, -4) === 'Path' and !dkiIsAbs($value)) {
+        $this->config->$option = dkiPath(getcwd()).'/'.dkiPath($value);
       }
     }
   }
@@ -436,25 +505,53 @@ class Deploki {
 
 class DeplokiBatch {
   public $config;       //= DeplokiConfig
+  public $chains;       //= hash of DeplokiChain
+  public $cache = false;
+  protected $cached = array();  //= hash of DeplokiChain
 
-  function __construct(DeplokiConfig $config) {
+  function __construct(DeplokiConfig $config, array $chains) {
     $this->config = clone $config;
+    $this->chains = $this->parse($chains);
   }
 
   //= hash of DeplokiChain
   function parse(array $chains) {
+    $result = array();
+
     foreach ($chains as $name => &$chain) {
-      $chain = new DeplokiChain($this->config, $chain, $name);
+      if (is_string($name) and strpbrk($name[0], '!?')) {
+        if (!!$this->config->debug !== ($name[0] === '?')) {
+          continue;
+        } else {
+          $name = substr($name, 1);
+        }
+      }
+
+      if (! $chain instanceof DeplokiChain) {
+        $chain = new DeplokiChain($this->config, $chain, $name);
+      }
+
+      $result[$name] = $chain;
     }
 
-    return $chains;
+    return $result;
   }
 
   //= hash of DeplokiChain that were ran
-  function process(array $pages) {
-    $pages = $this->parse($pages);
-    foreach ($pages as $chain) { $chain->execute(); }
-    return $pages;
+  function process() {
+    $result = array();
+
+    foreach ($this->chains as $key => $chain) {
+      if ($this->cache and isset($this->cached[$key])) {
+        $result[$key] = clone $this->cached[$key];
+      } else {
+        $chain = clone $chain;
+        $result[$key] = $chain->execute();
+        $this->cache and $this->cached[$key] = clone $chain;
+      }
+    }
+
+    return $result;
   }
 }
 
@@ -463,8 +560,8 @@ class DeplokiChain {
   public $filters = array();  //= array of DeplokiFilter
 
   public $name;               //= null, string
-  public $data = array();     //= array of string
-  public $urls = array();     //= array of string
+  public $data;               //= array of string
+  public $urls;               //= array of string
 
   //= array of string
   static function execGetData(DeplokiConfig $config, $filters, $name = null) {
@@ -479,6 +576,7 @@ class DeplokiChain {
     $this->config = clone $config;
     $this->name = $name;
     $this->filters = $this->parse($filters);
+    $this->reset();
   }
 
   //= array of DeplokiFilter
@@ -504,12 +602,22 @@ class DeplokiChain {
         }
 
         $filter = $baseConfig->filter($filter);
+
+        $perFilter = &$baseConfig->perFilter[$filter->name];
+        $options += (array) $perFilter;
+
         $filter->config->override($filter->normalize($options));
         $options = $filter;
       }
     }
 
     return $filters;
+  }
+
+  function reset() {
+    $this->data = array();
+    $this->urls = array();
+    return $this;
   }
 
   function execute() {
@@ -619,11 +727,25 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
                            'perLanguages' => true, 'withMedia' => true);
 
   public $shortOption = 'fromData';
+
+  public $libPath;          //= string defaults to $this->name + '.php'
   public $rendererConfig;   //= null, object filter-dependent - see configure()
   protected $currentLang;   //= null, str e.g. 'en', set by render()
 
+  //= bool indicating if the external framework (if any) is loaded; see load()
+  abstract function isLoaded();
+
   // Loads external framework (e.g. HTMLki) if this filter depends on it.
-  function load() { }
+  function load() {
+    if (!$this->isLoaded()) {
+      $file = $this->config->libPath;
+      $file or $file = $this->name.'.php';
+      $file = $this->absolute($file, $this->config->dkiPath);
+
+      include_once $file;
+      $this->isLoaded() or $this->fail("cannot load the library from [$file]");
+    }
+  }
 
   //* $config null, mixed filter-dependent - base config to set up.
   function configure($config = null) {
@@ -775,7 +897,7 @@ class DkiWrite extends DeplokiFilter {
 
 // Joins current data or wraps it in given chains, if passed.
 class DkiConcat extends DeplokiFilter {
-  public $defaults = array('glue' => "\n", 'reuseChains' => true);
+  public $defaults = array('glue' => "\n", 'cacheChain' => false, 'cutHeading' => false);
   public $shortOption = 'chains';
 
   protected function doExecute($chain, $config) {
@@ -792,22 +914,50 @@ class DkiConcat extends DeplokiFilter {
   function concatWith($chains, &$current) {
     foreach ($current as &$data) {
       $merged = '';
-      $results = array();
+      $cached = array();
+      $title = null;
 
       foreach ((array) $chains as $name => $chain) {
         if ($chain === null) {
           $merged .= $data;
-        } elseif (isset($results[$name])) {
-          $merged .= $results[$name];
+        } elseif (isset($cached[$name])) {
+          $merged .= $cached[$name];
         } else {
-          $result = join(DeplokiChain::execGetData($this->config, $chain, $name));
-          $this->config->reuseChains and $results[$name] = $result;
+          $chainConfig = $this->config;
+
+          if (!$this->config->cacheChain) {
+            $chainConfig = clone $chainConfig;
+
+            if (!isset($title)) {
+              $replace = $this->config->cutHeading ? '' : null;
+              $title = $this->cutHeading($data, $replace);
+              $title = $title ? strip_tags(trim($title[2])) : '';
+            }
+
+            $chainConfig->media += array('body' => $data, 'title' => $title);
+          }
+
+          $result = join(DeplokiChain::execGetData($chainConfig, $chain, $name));
+          $this->config->cacheChain and $cached[$name] = $result;
           $merged .= $result;
         }
       }
 
       $data = $merged;
     }
+  }
+
+  //= null if $html has no <hX> tag, array ('<hX>title...</hX>', 'hX', 'title...')
+  static function cutHeading(&$html, $replace = '') {
+    $regexp = '~<(h[1-6])\b[^>]*>(.*?)</\1>~us';
+    $heading = null;
+
+    $html = preg_replace_callback($regexp, function ($match) use (&$heading, $replace) {
+      $heading = $match;
+      return $replace === null ? $match[0] : $replace;
+    }, $html, 1);
+
+    return $heading;
   }
 }
 
@@ -872,7 +1022,7 @@ class DkiKeep extends DeplokiFilter {
       $isRegExp = $mask[0] === '~';
 
       foreach (array_keys($check) as $key) {
-        $value = $isWildcard ? basename($key) : strtr($key, '\\', '/');
+        $value = $isWildcard ? basename($key) : dkiPath($key);
         $keep = $isRegExp ? preg_match($mask, $value) : (stripos($value, $mask) !== false);
         if (!$keep) { unset($check[$key]); }
       }
@@ -895,15 +1045,18 @@ class DkiLink extends DeplokiFilter {
   protected function doExecute($chain, $config) {
     $query = array();
 
-    foreach ($chain->data as $path) {
-      $real = realfile($path) and $query[] = '0='.urlencode($real);
+    foreach ($chain->data as $path => $data) {
+      is_int($path) and $path = $data;
+      $real = realpath($path) and $query[] = count($query).'='.urlencode($real);
     }
 
-    $query[] = 'hash='.$config->hash(join('|', $query));
+    if ($query) {
+      $query[] = 'hash='.$config->hash(join('|', $query));
 
-    $linker = $this->config->absolute('link.php', $this->config->dkiPath);
-    $url = $this->config->urlOf($linker);
-    $chain->urls['linked'] = $url.'?'.join('&', $query);
+      $linker = $this->config->absolute('link.php', $this->config->dkiPath);
+      $url = $this->config->urlOf($linker);
+      $chain->urls['linked'] = $url.'?'.join('&', $query);
+    }
   }
 }
 
@@ -947,12 +1100,8 @@ class DkiHtmlki extends DeplokiRenderingFilter {
     $this->defaults += array('xhtml' => false);
   }
 
-  function load() {
-    if (!class_exists('HTMLki')) {
-      $file = $this->config->libPath('htmlki', 'htmlki.php');
-      include_once $file;
-      class_exists('HTMLki') or $this->fail("cannot load HTMLki from [$file]");
-    }
+  function isLoaded() {
+    return class_exists('HTMLki');
   }
 
   //* $kiCfg HTMLkiConfig
@@ -977,7 +1126,7 @@ class DkiHtmlki extends DeplokiRenderingFilter {
     function onInclude($template, HTMLkiTemplate $parent, HTMLkiTagCall $call) {
       // $SrcFile is set by $this->template().
       $path = $parent->SrcFile ? dirname($parent->SrcFile) : $this->config->inPath;
-      $file = rtrim($path, '\\/')."/_$template.html";
+      $file = dkiPath($path)."/_$template.html";
 
       $tpl = $this->template($file, $parent->config());
       $tpl->vars($call->vars + $parent->vars());
@@ -1016,18 +1165,17 @@ class DkiHtmlki extends DeplokiRenderingFilter {
 
 // UverseWiki renderer - transforms wiki markup into HTML.
 class DkiUwiki extends DeplokiRenderingFilter {
+  public $libPath = 'uwiki/uversewiki.php';
+
   protected function initialize($config) {
     parent::initialize($config);
     // 'fsCharset' needs iconv extension.
-    $this->defaults += array('xhtml' => false, 'markup' => 'wiki', 'fsCharset' => null);
+    $this->defaults += array('xhtml' => false, 'markup' => 'wiki',
+                             'fsCharset' => null);
   }
 
-  function load() {
-    if (!class_exists('UWikiDocument')) {
-      $file = $this->config->libPath('uwiki', 'uwiki/uversewiki.php');
-      include_once $file;
-      class_exists('UWikiDocument') or $this->fail("cannot load UverseWiki from [$file]");
-    }
+  function isLoaded() {
+    return class_exists('UWikiDocument');
   }
 
   protected function doConfigure($uwCfg = null) {
@@ -1039,7 +1187,7 @@ class DkiUwiki extends DeplokiRenderingFilter {
     $uwCfg->pager = new UWikiFilePager($this->config->inPath);
     $uwCfg->pager->nameConvertor = array($this, 'nameConvertor');
 
-    $uwCfg->LoadFrom(UWikiRootPath.'\\config');
+    $uwCfg->LoadFrom(UWikiRootPath.'/config');
     $uwCfg->LoadFrom($this->config->absolute('uwiki', $this->config->inPath));
 
     return $uwCfg;

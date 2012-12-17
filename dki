@@ -1,10 +1,34 @@
 #!/usr/bin/env php
 <?php
-defined('STDIN') or die('This script is meant to be ran from the shell.');
+defined('STDIN') or die('This script is meant for running from the shell.');
 
 require_once dirname(__FILE__).'/deploki.php';
 Deploki::prepareEnvironment();
-$options = DeplokiOptions::loadFrom(Deploki::locateConfig());
+
+$arrays = array();
+foreach (ArrayObject(new DeplokiConfig) as $option => $value) {
+  is_array($value) and $arrays[] = $option;
+}
+
+array_shift($argv);   // the name of script being ran by PHP.
+reset($argv) === '--' and array_shift($argv);   // leftover of "php f.php -- ...'
+extract(Deploki::parseCL($argv, $arrays));
+
+$config = $index ? $index[0] : getcwd();
+$config = DeplokiConfig::loadFrom(DeplokiConfig::locate($config));
+
+foreach ($options as $option => $value) {
+  if (strrchr($option, '-') !== false) {
+    $option = preg_replace('/-(\w)/e', 'strtoupper("\\1")', $option);
+  } elseif (!$config->has($option) and $config->has($option.'Path')) {
+    $option .= 'Path';
+  }
+
+  $config->$option = is_array($value) ? ($value + $config->$option) : $value
+}
 
 $deploki = new Deploki($config);
+empty($flags['d']) or debugBreak();
 $deploki->deploy($config->pages);
+
+echo 'Done.';

@@ -1,9 +1,10 @@
 <?php
+$oldWD = getcwd();
 chdir(dirname(__FILE__));
 
 require_once 'deploki.php';
 Deploki::prepareEnvironment();
-$config = DeplokiConfig::loadFrom(Deploki::locateConfig());
+$config = DeplokiConfig::loadFrom(DeplokiConfig::locate($oldWD));
 
 $canDebug = $config->debug;
 $config->debug &= empty($_REQUEST['stage']);
