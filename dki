@@ -18,7 +18,10 @@ extract(Deploki::parseCL($argv, $arrays));
 
 $config = $index ? $index[0] : getcwd();
 $config = DeplokiConfig::loadFrom(DeplokiConfig::locate($config));
+
 isset($flags['d']) and $options += array('debug' => true);
+isset($flags['f']) and $config->perFilter['omitold']->condition = false;
+isset($flags['y']) and error_reporting(error_reporting() & ~E_USER_WARNING);
 
 foreach ($options as $option => $value) {
   if (strrchr($option, '-') !== false) {
@@ -30,8 +33,48 @@ foreach ($options as $option => $value) {
   $config->$option = is_array($value) ? ($value + $config->$option) : $value;
 }
 
+function dkiConsoleLogger($msg, $filter = null) {
+  global $commonPath;
+
+  if ($filter instanceof DeplokiConfig) {
+    $config = $filter;
+  } elseif ($filter->config instanceof DeplokiConfig) {
+    $config = $filter->config;
+  } else {
+    $config = new stdClass;
+  }
+
+  if ($filter instanceof DeplokiFilter) {
+    $msg = strtoupper($filter->name).': '.$msg;
+  } elseif ($filter instanceof DeplokiBatch) {
+    echo PHP_EOL, '  ';
+    $msg = is_numeric($msg) ? "#$msg" : "- $msg -";
+  }
+
+  $msgTR = array(" $commonPath/" => ' ');
+  $url = dkiPath($config->urls['outPath']) and $msgTR[" $url/"] = ' @/';
+
+  echo str_repeat('  ', $config->nestingLevel),
+       trim(strtr(" $msg", $msgTR)), PHP_EOL;
+}
+
+global $commonPath;
+$in = explode('/', dkiPath($config->inPath));
+$out = explode('/', dkiPath($config->outPath));
+
+for ($i = min(count($in), count($out)); $i > 0; --$i) {
+  if (array_slice($in, 0, $i) === array_slice($out, 0, $i)) {
+    $commonPath = join('/', array_slice($in, 0, $i));
+    break;
+  }
+}
+
+$config->logger = 'dkiConsoleLogger';
+
+echo "Deploying from [{$config->inPath}]...", PHP_EOL;
+
 $deploki = new Deploki($config);
 isset($flags['b']) and debugBreak();
 $deploki->deploy($config->pages);
 
-echo "Deployed to [{$config->outPath}].";
+echo PHP_EOL, "Deployed to [{$config->outPath}].";

@@ -19,6 +19,10 @@ function dkiGet($array, $key, $default = null) {
   return (is_array($array) and isset($array[$key])) ? $array[$key] : $default;
 }
 
+function dkiLang($num, $word, $plural = 's') {
+  return $num." $word".($num === 1 ? '' : $plural);
+}
+
 class DeplokiError extends Exception { }
 
 class DeplokiFilterError extends Exception {
@@ -63,13 +67,8 @@ class DeplokiConfig {
   public $filePerms;    //= integer umask for newly created files like 0777
   public $viaAliases;   //= hash of string 'alias' => 'realVia'
   public $perFilter;    //= hash of hash, hash of DeplokiConfig
-
-  /*---------------------------------------------------------------------
-  | FILTER-SPECIFIC
-  |--------------------------------------------------------------------*/
-
-  //= string 'debug' or 'stage', callable (Filter, Chain), mixed filter-specific
-  public $condition       = null;
+  public $logger;       //= callable ($msg, DeplokiFilter = null)
+  public $nestingLevel; //= int depth of current filter chain (> 0)
 
   /*---------------------------------------------------------------------
   | METHODS
@@ -149,7 +148,10 @@ class DeplokiConfig {
       'wiki'              => 'uwiki',
     );
 
-    $this->perFilter      = array();
+    // '' applies to all filters.
+    $this->perFilter      = array('' => array());
+    $this->logger         = null;
+    $this->nestingLevel   = 0;
 
     return $this;
   }
@@ -321,6 +323,10 @@ class DeplokiConfig {
   //= hash 'js' => array('media/all/libs.js', ...)
   function mediaVars() {
     if (! $this->media instanceof DeplokiBatch) {
+      if ($this->logger and $count = count($this->media)) {
+        call_user_func($this->logger, "- MEDIA VARS ($count) -", $this);
+      }
+
       $batchConfig = clone $this;
       $batchConfig->media = array();   // to avoid recursion.
       $this->media = new DeplokiBatch($batchConfig, $this->media);
@@ -342,6 +348,14 @@ class DeplokiConfig {
     }
 
     return $result;
+  }
+
+  function addMedia($name, $chain) {
+    if ($this->media instanceof DeplokiBatch) {
+      $this->media->add(array($name => $chain));
+    } else {
+      $this->media[$name] = $chain;
+    }
   }
 
   //= string translated & formatted
@@ -387,6 +401,15 @@ class Deploki {
 
   static function warn($msg) {
     trigger_error("Deploki: $msg", E_USER_WARNING);
+  }
+
+  static function fileVars($path, $typeVar, $nameVar, $pathVar = null) {
+    $pathVar and $pathVar = array($pathVar => dirname($path));
+
+    return ((array) $pathVar) + array(
+      $typeVar            => $ext = ltrim(strrchr($path, '.'), '.'),
+      $nameVar            => basename($path, ".$ext"),
+    );
   }
 
   // From http://proger.i-forge.net/Various_format_parsing_functions_for_PHP/ein
@@ -496,15 +519,25 @@ class Deploki {
   }
 
   function deploy(array $pages) {
-    $this->prepare();
+    $this->prepare($pages);
     $batch = new DeplokiBatch($this->config, $pages);
     return $batch->process();
   }
 
-  function prepare() {
+  function prepare(array &$pages) {
     foreach ((array) $this->config as $option => $value) {
       if (substr($option, -4) === 'Path' and !dkiIsAbs($value)) {
         $this->config->$option = dkiPath(getcwd()).'/'.dkiPath($value);
+      }
+    }
+
+    // preprocess media so it's cached for all batches we're going to run.
+    is_array($this->config->media) and $this->config->mediaVars();
+
+    foreach ($pages as $key => &$page) {
+      if (!isset($page['write']) and !in_array('write', $page)) {
+        is_int($key) and $key = '{FILE}.html';;
+        $page['write'] = $this->config->absolute($key, $this->config->outPath);
       }
     }
   }
@@ -547,11 +580,16 @@ class DeplokiBatch {
   //= hash of DeplokiChain that were ran
   function process() {
     $result = array();
+    $logger = $this->config->loggeræ;
 
     foreach ($this->chains as $key => $chain) {
       if ($this->cache and isset($this->cached[$key])) {
         $result[$key] = clone $this->cached[$key];
       } else {
+        if ($logger and (count($chain) != 1 or $chain[0]->name != 'raw')) {
+          call_user_func($logger, $key, $this);
+        }
+
         $chain = clone $chain;
         $result[$key] = $chain->execute();
         $this->cache and $this->cached[$key] = clone $chain;
@@ -559,6 +597,13 @@ class DeplokiBatch {
     }
 
     return $result;
+  }
+
+  function add($chains) {
+    $chains = $this->parse((array) $chains);
+    $this->chains = $chains + $this->chains;
+    $this->cached = array_diff_key($this->cached, $chains);
+    return $this;
   }
 }
 
@@ -575,12 +620,21 @@ class DeplokiChain {
     return (array) self::make($config, $filters, $name)->execute()->data;
   }
 
+  //= array of string
+  static function execWithData(DeplokiConfig $config, $filters, array $data, $name = null) {
+    $chain = DeplokiChain::make($config, $filters, $name);
+    $chain->data = $data;
+    return $chain->execute()->data;
+  }
+
   static function make(DeplokiConfig $config, $filters, $name = null) {
     return new self($config, $filters, $name);
   }
 
   function __construct(DeplokiConfig $config, $filters, $name = null) {
     $this->config = clone $config;
+    ++$this->config->nestingLevel;
+
     $this->name = $name;
     $this->filters = $this->parse($filters);
     $this->reset();
@@ -610,8 +664,9 @@ class DeplokiChain {
 
         $filter = $baseConfig->filter($filter);
 
-        $perFilter = dkiGet($baseConfig->perFilter, $filter->name);
-        $options = $filter->expandOptions($options) + ((array) $perFilter);
+        $options = $filter->expandOptions($options) +
+                   ((array) dkiGet($baseConfig->perFilter, $filter->name)) +
+                   ((array) dkiGet($baseConfig->perFilter, ''));
 
         $filter->config->override($filter->normalize($options));
         $options = $filter;
@@ -679,7 +734,7 @@ abstract class DeplokiFilter {
 
   //= hash always
   function expandOptions($option) {
-    if (is_array($option)) {
+    if (is_array($option) and !isset($option[0])) {
       return $option;
     } elseif (isset($this->shortOption)) {
       return array($this->shortOption => $option);
@@ -696,6 +751,10 @@ abstract class DeplokiFilter {
     Deploki::warn(ucfirst($this->name)." filter $msg.");
   }
 
+  function log($msg) {
+    $this->config->logger and call_user_func($this->config->logger, $msg, $this);
+  }
+
   function execute(DeplokiChain $chain) {
     if ($this->canExecute($chain)) {
       $this->doExecute($this->chain = $chain, $this->config);
@@ -709,28 +768,30 @@ abstract class DeplokiFilter {
   function canExecute(DeplokiChain $chain) {
     $can = true;
 
-    switch ($cond = $this->config->condition) {
+    switch ($cond = &$this->config->condition) {
     case 'debug':   $can &= $this->config->debug; break;
     case 'stage':   $can &= !$this->config->debug; break;
-    default:        is_callable($cond) and $can &= call_user_func($cond, $this, $chain);
+    default:
+      if (is_callable($cond)) {
+        $can &= call_user_func($cond, $this, $chain);
+      } elseif (is_bool($cond)) {
+        $can &= $cond;
+      }
     }
 
+    $can or $this->log("skipped by condition".($cond ? " '$cond'" : ''));
     return (bool) $can;
   }
 
   function expand($name, array $vars = array()) {
-    $vars += array(
-      'type'            => $ext = ltrim(strrchr($this->chain->name, '.'), '.'),
-      'name'            => basename($this->chain->name, ".$ext"),
-    );
-
+    $vars += Deploki::fileVars($this->chain->name, 'type', 'name');
     return $this->config->expand($name, $vars);
   }
 }
 
 // Renderers are filters that transform one markup into another (e.g. wiki to HTML).
 abstract class DeplokiRenderingFilter extends DeplokiFilter {
-  // 'configurator' is a function ($config, Filter); if returns non-null value
+  // 'configurator' is a function ($config, DeplokiFilter); if returns non-null value
   // it's used instead of passed $config.
   public $defaults = array('fromData' => true, 'compact' => null,
                            'configurator' => null, 'vars' => array(),
@@ -827,6 +888,7 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
     $this->load();
     $this->rendererConfig = $this->configure();
     $datas = $chain->data;
+    $this->log('rendering '.dkiLang(count($datas), 'item'));
 
     foreach ($datas as $key => &$data) {
       $rendered = $this->render($data, $key);
@@ -846,7 +908,7 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
   // Lightweight HTML minification - collapses successive whitespace into one.
   function compact($html) {
     $html = preg_replace('/\s*(\n)\s*|(\s)\s+/u', '\1\2', $html);
-    return $html;
+    return trim($html);
   }
 }
 
@@ -871,49 +933,67 @@ class DkiRead extends DeplokiFilter {
     $files = array();
 
     foreach ((array) $config->masks as $mask) {
-      $path = $config->absolute($mask, $config->outPath);
+      $path = $config->absolute($this->expand($mask), $config->outPath);
       $files = array_merge($files, glob($path, GLOB_NOESCAPE | GLOB_BRACE));
     }
 
     $files = array_unique($files);
 
     // note that all items in $files exist thanks to glob().
-    foreach ($files as $path) {
-      $chain->data[$path] = $this->config->readFile($path);
+    foreach ($files as $path) { $chain->data[$path] = $this->read($path); }
+  }
+
+  function read($file) {
+    $this->log($file);
+    return $this->config->readFile($file);
+  }
+}
+
+// The same as READ but also formats the data as if {EXT} filter was applied to it.
+class DkiReadfmt extends DkiRead {
+  function read($file) {
+    $data = parent::read($file);
+    $ext = ltrim(strrchr($file, '.'), '.');
+
+    if ($ext) {
+      $data = join(DeplokiChain::execWithData($this->config, $ext, array($file => $data),
+                                              $this->chain->name.".$ext"));
     }
+
+    return $data;
   }
 }
 
 // Writes current data to local files and provides their URLs.
 class DkiWrite extends DeplokiFilter {
-  // 'url' may contain '{VAR}'s or be a function ($file, array $vars, Filter).
-  // 'dest' can be a function (Filter, array $vars).
-  public $defaults = array('url' => null);
+  // 'url' may contain '{VAR}'s or be a function ($file, array $vars, DeplokiFilter).
+  // 'dest' can be a function (DeplokiFilter, array $vars).
+  public $defaults = array('url' => null, 'default' => '{NAME}.{TYPE}',
+                           'root' => '{MEDIAPATH}');
   public $shortOption = 'dest';
 
   protected function doExecute($chain, $config) {
     foreach ($chain->data as $src => &$data) {
-      $vars = array(
-        'src'             => $src,
-        'path'            => dirname($src),
-        'ext'             => $ext = ltrim(strrchr(basename($src), '.'), '.'),
-        'file'            => basename($src, ".$ext"),
-      );
+      $vars = Deploki::fileVars($src, 'ext', 'file', 'path') + compact('src');
 
-      if (is_callable( $dest = $config->dest )) {
+      $dest = $config->dest;
+      $dest or $dest = $config->default;
+
+      if (is_callable($dest)) {
         $dest = call_user_func($dest, $this, $vars);
       } else {
         $dest = $this->expand($dest, $vars);
       }
 
-      $dest = $config->absolute($dest, $config->mediaPath);
+      $dest = $config->absolute($dest, $config->expand($config->root));
       $this->write($dest, $data, $vars);
     }
   }
 
   function write($dest, $data, array $vars) {
     $this->config->writeFile($dest, $data);
-    $this->chain->urls[$vars['src']] = $this->urlOf($dest, $vars);
+    $url = $this->chain->urls[$vars['src']] = $this->urlOf($dest, $vars);
+    $this->log("$vars[src] -> $dest -> $url");
   }
 
   function urlOf($file, array $vars) {
@@ -932,6 +1012,20 @@ class DkiWrite extends DeplokiFilter {
 // Removes already up-to-date files from the chain.
 class DkiOmitold extends DkiWrite {
   public $shortOption = 'dest';
+
+  protected function initialize($config) {
+    parent::initialize($config);
+    $this->defaults['default'] = '{FILE}.html';
+    $this->defaults['root'] = '{OUTPATH}';
+  }
+
+  protected function doExecute($chain, $config) {
+    $was = count($chain->data);
+    parent::doExecute($chain, $config);
+
+    $delta = $was - count($chain->data);
+    $this->log('ignored '.dkiLang($delta, 'file'));
+  }
 
   function write($dest, $data, array $vars) {
     $old = (is_file($dest) and filemtime($dest) >= filemtime($vars['src']));
@@ -954,17 +1048,24 @@ class DkiConcat extends DeplokiFilter {
 
   protected function doExecute($chain, $config) {
     if ($chain->data) {
+      $count = dkiLang(count($chain->data), 'input item');
+
       if ($config->chains) {
+        $this->log($count);
         $this->concatWith($config->chains, $chain->data);
       } else {
         $glue = $this->expand($config->glue);
         $chain->data = array('concat' => join($glue, $chain->data));
+
+        trim($glue) === '' and $glue = chunk_split(strtoupper(bin2hex($glue)), 2, ' ');
+        $glue === '' or $glue = " with $glue";
+        $this->log("joined $count$glue");
       }
     }
   }
 
   function concatWith($chains, &$current) {
-    foreach ($current as &$data) {
+    foreach ($current as $src => &$data) {
       $merged = '';
       $cached = array();
       $title = $this->config->title;
@@ -975,11 +1076,10 @@ class DkiConcat extends DeplokiFilter {
         } elseif (isset($cached[$name])) {
           $merged .= $cached[$name];
         } else {
-          $chainConfig = $this->config;
+          $chainConfig = clone $this->config;
+          $chainConfig->override(Deploki::fileVars($src, 'catExt', 'catFile', 'catPath'));
 
           if (!$this->config->cacheChain) {
-            $chainConfig = clone $chainConfig;
-
             if (!isset($title)) {
               $replace = $this->config->cutTitle ? '' : null;
               $title = $this->cutHeading($data, $replace);
@@ -989,9 +1089,7 @@ class DkiConcat extends DeplokiFilter {
             $vars = array('body' => $data, 'title' => $title);
 
             foreach ($vars as $name => &$value) {
-              if (!isset($chainConfig->media[$name])) {
-                $chainConfig->media[$name] = array('raw' => $value);
-              }
+              $chainConfig->addMedia($name, array('raw' => $value));
             }
           }
 
@@ -1030,9 +1128,8 @@ class DkiMinify extends DeplokiFilter {
     }
 
     foreach ($chain->data as $key => &$data) {
-      $minifier = DeplokiChain::make($config, "minify$ext", $chain->name);
-      $minifier->data[$key] = $data;
-      $data = join($minifier->execute()->data);
+      $data = join(DeplokiChain::execWithData($config, "minify$ext",
+                                              array($key => $data), $chain->name));
     }
   }
 }
@@ -1045,6 +1142,7 @@ class DkiMinifycss extends DeplokiFilter {
 
   // From http://proger.i-forge.net/CSS_enchant-minification_layer_for_PHP/OSq.
   function minify($css, DeplokiConfig $config) {
+    $original = strlen($css);
     $css = preg_replace('~\s+~', ' ', $css);
 
     if (preg_last_error() != 0) {
@@ -1056,7 +1154,29 @@ class DkiMinifycss extends DeplokiFilter {
     $regexp = '/\*.*?\*/ | '.$path.'{1,50} \s*\{\s*}\s* | \s*([;:{,}])\s+ | ;\s*(})\s* | '.
               "\\b(?<!-)0(\.\d) | (\#) $hex\\5$hex\\6$hex\\7 | \s+([+>,])\s+";
 
-    return trim(preg_replace("~$regexp~x", '\1\2\3\4\5\6\7\8', $css));
+    $css = trim(preg_replace("~$regexp~x", '\1\2\3\4\5\6\7\8', $css));
+
+    $this->log($this->numFmt($original).' -> '.$this->numFmt(strlen($css)).
+               ' = '.$this->numFmt(strlen($css) - $original).' bytes');
+
+    return $css;
+  }
+
+  function numFmt($num) {
+    return number_format($num, 0, '.', ' ');
+  }
+}
+
+// Fixes url(...) paths in CSS - useful when storing joined/minified styles elsewhere.
+class DkiCssurl extends DeplokiFilter {
+  public $defaults = array('url' => '../');
+  public $shortOption = 'url';
+
+  protected function doExecute($chain, $config) {
+    foreach ($chain->data as &$data) {
+      $data = preg_replace('~(\burl\(["\']?)([^"\']+?)(["\']?\))~u',
+                           "$1{$config->url}$2$3", $data);
+    }
   }
 }
 
@@ -1073,6 +1193,7 @@ class DkiVia extends DeplokiFilter {
 
   function execScript($_file) {
     is_file($_file) or $_file->fail("cannot find script [$file] to execute");
+    $this->log($file);
 
     $chain = $this->chain;
     $config = $this->config;
@@ -1087,7 +1208,10 @@ class DkiKeep extends DeplokiFilter {
   protected function doExecute($chain, $config) {
     $toKeep = $this->getKeeping($chain, $config);
     $all = array_keys($chain->urls ? $chain->urls : $chain->data);
-    array_map(array($chain, 'removeData'), array_diff($all, $toKeep));
+
+    $toRemove = array_diff($all, $toKeep);
+    array_map(array($chain, 'removeData'), $toRemove);
+    $this->log('ignored '.dkiLang(count($toRemove), 'item'));
   }
 
   function getKeeping($chain, $config) {
@@ -1140,6 +1264,7 @@ class DkiLink extends DeplokiFilter {
     }
 
     if ($query) {
+      $this->log(dkiLang(count($chain->data), 'linked resource'));
       $query[] = 'hash='.$config->hash(join('|', $query));
 
       if ($linker = $config->linker) {
@@ -1173,7 +1298,7 @@ class DkiVersion extends DeplokiFilter {
         if ($ver <= 0 or $versions[$key]['md5'] !== $hash) {
           $versions[$key]['md5'] = $hash;
           $hasObsolete = true;
-          ++$ver;
+          $this->log(basename($url).' is obsolete - now v'.++$ver);
         }
 
         $url .= strrchr($url, '?') === false ? '?' : '&';
@@ -1184,6 +1309,8 @@ class DkiVersion extends DeplokiFilter {
     if ($hasObsolete) {
       $export = "<?php\nreturn ".var_export($versions, true).';';
       $config->writeFile($store, $export);
+    } else {
+      $this->log('nothing obsolete');
     }
   }
 }
@@ -1219,9 +1346,15 @@ class DkiHtmlki extends DeplokiRenderingFilter {
 
     //= HTMLkiTemplate
     function onInclude($template, HTMLkiTemplate $parent, HTMLkiTagCall $call) {
+      if (strpbrk($template, '\\/') === false) {
+        $template = "_$template";
+      } else {
+        $template = dirname($template).'/_'.basename($template);
+      }
+
       // $SrcFile is set by $this->template().
       $path = $parent->SrcFile ? dirname($parent->SrcFile) : $this->config->inPath;
-      $file = dkiPath($path)."/_$template.html";
+      $file = dkiPath($path)."/$template.html";
 
       $tpl = $this->template($file, $parent->config());
       $tpl->vars($call->vars + $parent->vars());
@@ -1231,7 +1364,7 @@ class DkiHtmlki extends DeplokiRenderingFilter {
 
   protected function doRender(array $vars, $data) {
     if ($this->config->fromData) {
-      $tpl = $this->templateFromData($data, $this->rendererConfig);
+      $tpl = $this->templateFromData($data, $this->rendererConfig, dkiGet($vars, 'src'));
     } else {
       $tpl = $this->template($data, $this->rendererConfig);
     }
@@ -1311,6 +1444,14 @@ class DkiUwiki extends DeplokiRenderingFilter {
 
     $doc = new UWikiDocument($data);
     $doc->settings = $this->rendererConfig;
+
+    if ($src = dkiPath(dkiGet($vars, 'src')) and
+        strpos($src, $base = dkiPath($doc->settings->pager->GetBaseDir()).'/') === 0) {
+      $src = substr($src, strlen($base));
+    }
+
+    $doc->settings->pager->SetCurrent("/$src");
+
     $markup = $this->config->markup === 'wiki' ? 'wacko' : $this->config->markup;
     $doc->LoadMarkup($markup);
     $doc->Parse();
