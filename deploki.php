@@ -15,8 +15,14 @@ function dkiIsAbs($path) {
          (strpbrk($path[0], '\\/') !== false  or strpos($path, ':') !== false);
 }
 
+// Unlike (array) it won't convert objects.
+//= array always
+function dkiArray($value) {
+  return is_array($value) ? $value : array($value);
+}
+
 function dkiGet($array, $key, $default = null) {
-  return (is_array($array) and isset($array[$key])) ? $array[$key] : $default;
+  return (is_array($array) and array_key_exists($key, $array)) ? $array[$key] : $default;
 }
 
 function dkiLang($num, $word, $plural = 's') {
@@ -65,6 +71,7 @@ class DeplokiConfig {
 
   public $dirPerms;     //= integer umask for newly created directories like 0777
   public $filePerms;    //= integer umask for newly created files like 0777
+  public $langLineWarn; //= bool if a missing language line should emit a warning or not
   public $viaAliases;   //= hash of string 'alias' => 'realVia'
   public $perFilter;    //= hash of hash, hash of DeplokiConfig
   public $logger;       //= callable ($msg, DeplokiFilter = null)
@@ -127,7 +134,8 @@ class DeplokiConfig {
 
   // Does not reset $secret.
   function defaults($inPath = null) {
-    $this->debug          = dkiGet($_SERVER, 'REMOTE_ADDR') === '127.0.0.1';
+    $this->debug          = (dkiGet($_SERVER, 'REMOTE_ADDR') === '127.0.0.1'
+                             or getenv('comspec'));
     $this->app            = null;
 
     $this->dkiPath        = dirname(__FILE__);
@@ -141,6 +149,7 @@ class DeplokiConfig {
 
     $this->dirPerms       = 0755;
     $this->filePerms      = 0744;
+    $this->langLineWarn   = true;
 
     $this->viaAliases     = array(
       'htm'               => 'html',
@@ -336,11 +345,22 @@ class DeplokiConfig {
     $result = array();
 
     foreach ($this->media->process() as $name => $chain) {
+      // $name = name[.[ext]]; vars containing the same 'ext' are joined
+      // together; vars without a dot not but their values are joined into
+      // a string; vars ending on '.' are are passed to the template as
+      // is (even if they're not scalar).
       $ext = ltrim(strrchr($name, '.'), '.');
       $values = $chain->urls ? $chain->urls : $chain->data;
 
-      if ($ext === '') {
-        $result[$name] = join($values);
+      if (strrchr($name, '.') === false) {
+        $values = dkiArray($values);
+        if (count($values) == 1 and !is_scalar(reset($values))) {
+          $result[$name] = reset($values);
+        } else {
+          $result[$name] = join($values);
+        }
+      } elseif ($ext === '') {
+        $result[rtrim($name, '.')] = $values;
       } else {
         isset($result[$ext]) or $result[$ext] = array();
         $result[$ext] = array_merge($result[$ext], $values);
@@ -355,6 +375,14 @@ class DeplokiConfig {
       $this->media->add(array($name => $chain));
     } else {
       $this->media[$name] = $chain;
+    }
+  }
+
+  function hasMedia($name) {
+    if ($this->media instanceof DeplokiBatch) {
+      $this->media->has($name);
+    } else {
+      return isset($this->media[$name]);
     }
   }
 
@@ -375,7 +403,7 @@ class DeplokiConfig {
     } else {
       if (!isset($line)) {
         $line = $str;
-        Deploki::warn("Missing language string [$str].");
+        $this->langLineWarn and Deploki::warn("Missing language string [$str].");
       }
 
       return str_replace(array_map(array($this, 'langVar'), $format), $format, $line);
@@ -599,8 +627,12 @@ class DeplokiBatch {
     return $result;
   }
 
+  function has($chain) {
+    return isset($this->chains[$chain]);
+  }
+
   function add($chains) {
-    $chains = $this->parse((array) $chains);
+    $chains = $this->parse(dkiArray($chains));
     $this->chains = $chains + $this->chains;
     $this->cached = array_diff_key($this->cached, $chains);
     return $this;
@@ -789,6 +821,32 @@ abstract class DeplokiFilter {
   }
 }
 
+// Transforms passed data to another requivalent representation (e.g. more compact).
+abstract class DeplokiMinifyingFilter extends DeplokiFilter {
+  public $logSuffix = '';   //= string to add to "X -> Y = Z bytes" output.
+
+  protected function doExecute($chain, $config) {
+    foreach ($chain->data as &$data) { $data = $this->minify($data, $config); }
+  }
+
+  function minify($code, DeplokiConfig $config) {
+    $original = strlen($code);
+    $code = $this->doMinify($code, $config);
+
+    $this->log($this->numFmt($original).' -> '.$this->numFmt(strlen($code)).
+               ' = '.$this->numFmt(strlen($code) - $original).' bytes'.
+               $this->logSuffix);
+
+    return $code;
+  }
+
+  protected abstract function doMinify($code, $config);
+
+  function numFmt($num) {
+    return number_format($num, 0, '.', ' ');
+  }
+}
+
 // Renderers are filters that transform one markup into another (e.g. wiki to HTML).
 abstract class DeplokiRenderingFilter extends DeplokiFilter {
   // 'configurator' is a function ($config, DeplokiFilter); if returns non-null value
@@ -853,6 +911,8 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
     $languages or $this->warn('is given an empty language list to render into');
 
     foreach ($languages as $language) {
+      $this->currentLang = $language;
+
       $vars = $this->config->vars + compact('languages', 'language', 'src') +
               $media + $this->config->vars();
 
@@ -861,7 +921,6 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
         $rendered = $this->compact($rendered);
       }
 
-      $this->currentLang = $language;
       $result[$language] = $rendered;
     }
 
@@ -916,12 +975,21 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
 | STANDARD FILTERS
 |----------------------------------------------------------------------*/
 
-// Puts input as it is into the chain's data.
+// Puts input as it is into the chain's data overwriting existing items.
 class DkiRaw extends DeplokiFilter {
   public $shortOption = 'data';
 
   protected function doExecute($chain, $config) {
-    $chain->data = (array) $config->data + $chain->data;
+    $chain->data = dkiArray($config->data) + $chain->data;
+  }
+}
+
+// Adds given URL(s) to the chain's URL list overwriting existing items.
+class DkiUrl extends DeplokiFilter {
+  public $shortOption = 'urls';
+
+  protected function doExecute($chain, $config) {
+    $chain->urls = dkiArray($config->urls) + $chain->urls;
   }
 }
 
@@ -976,12 +1044,18 @@ class DkiWrite extends DeplokiFilter {
     foreach ($chain->data as $src => &$data) {
       $vars = Deploki::fileVars($src, 'ext', 'file', 'path') + compact('src');
 
+      $lang = (string) strrchr($src, '_');
+      if (in_array($lang = substr($lang, 1), $this->config->languages)) {
+        $vars['lang'] = $lang;
+      }
+
       $dest = $config->dest;
       $dest or $dest = $config->default;
 
       if (is_callable($dest)) {
         $dest = call_user_func($dest, $this, $vars);
       } else {
+        strpos($dest, '{HASH}') === false or $vars['hash'] = md5($data);
         $dest = $this->expand($dest, $vars);
       }
 
@@ -992,8 +1066,14 @@ class DkiWrite extends DeplokiFilter {
 
   function write($dest, $data, array $vars) {
     $this->config->writeFile($dest, $data);
-    $url = $this->chain->urls[$vars['src']] = $this->urlOf($dest, $vars);
-    $this->log("$vars[src] -> $dest -> $url");
+
+    if ($url = $this->urlOf($dest, $vars)) {
+      $this->chain->urls[$vars['src']] = $url;
+    } else {
+      $url = '-';
+    }
+
+    $this->log("$vars[src] -> $dest -> @$url");
   }
 
   function urlOf($file, array $vars) {
@@ -1003,7 +1083,7 @@ class DkiWrite extends DeplokiFilter {
       return call_user_func($url, $file, $vars, $this);
     } elseif ($url) {
       return $this->expand($url, $vars);
-    } else {
+    } elseif ($url === null) {
       return $this->config->urlOf($file);
     }
   }
@@ -1135,15 +1215,10 @@ class DkiMinify extends DeplokiFilter {
 }
 
 // Minifies CSS code.
-class DkiMinifycss extends DeplokiFilter {
-  protected function doExecute($chain, $config) {
-    foreach ($chain->data as &$data) { $data = $this->minify($data, $config); }
-  }
-
+class DkiMinifycss extends DeplokiMinifyingFilter {
   // From http://proger.i-forge.net/CSS_enchant-minification_layer_for_PHP/OSq.
-  function minify($css, DeplokiConfig $config) {
-    $original = strlen($css);
-    $css = preg_replace('~\s+~', ' ', $css);
+  protected function doMinify($code, $config) {
+    $code = preg_replace('~\s+~', ' ', $code);
 
     if (preg_last_error() != 0) {
       $this->fail('can\'t run preg_replace() - make sure that CSS is encoded in UTF-8');
@@ -1154,16 +1229,105 @@ class DkiMinifycss extends DeplokiFilter {
     $regexp = '/\*.*?\*/ | '.$path.'{1,50} \s*\{\s*}\s* | \s*([;:{,}])\s+ | ;\s*(})\s* | '.
               "\\b(?<!-)0(\.\d) | (\#) $hex\\5$hex\\6$hex\\7 | \s+([+>,])\s+";
 
-    $css = trim(preg_replace("~$regexp~x", '\1\2\3\4\5\6\7\8', $css));
+    return trim(preg_replace("~$regexp~x", '\1\2\3\4\5\6\7\8', $code));
+  }
+}
 
-    $this->log($this->numFmt($original).' -> '.$this->numFmt(strlen($css)).
-               ' = '.$this->numFmt(strlen($css) - $original).' bytes');
+// Minifies JavaScript code.
+class DkiMinifyjs extends DeplokiMinifyingFilter {
+  // in libPaths, if value is prefixed with '@' process exit code isn't checked.
+  public $defaults = array('tool' => 'auto', 'libPaths' => array(
+    // YUI UglifyJS for Node.js: https://github.com/yui/yuglify
+    'yuglify'             => 'yuglify --terminal --type js',
+    // UglifyJS2 for Node.js: https://github.com/mishoo/UglifyJS2
+    // uglifyjs* only support /dev/stdin on *nix.
+    'uglifyjs2'           => 'uglifyjs2 {TEMP}',
+    // UglifyJS for Node.js: https://github.com/mishoo/UglifyJS
+    'uglifyjs'            => 'uglifyjs {TEMP}',
+    // https://github.com/rgrove/jsmin-php
+    'jsmin-php'           => 'jsmin.php',
+  ));
 
-    return $css;
+  public $shortOption = 'tool';
+
+  protected function doMinify($code, $config) {
+    $tool = $this->loadTool($config->tool);
+    $this->logSuffix = " via $tool";
+    $paths = $this->config->libPaths;
+
+    if ($tool === 'jsmin-php') {
+      return JSMin::minify($code);
+    } else {
+      $streams = array(array('pipe', 'r'), array('pipe', 'w'));
+      defined('STDERR') and $streams[] = STDERR;
+
+      $cmd = ltrim($paths[$tool], '@');
+      $temp = strpos($cmd, '{TEMP}') ? $this->makeTemp($code) : null;
+      $temp and $cmd = str_replace('{TEMP}', escapeshellarg($temp), $cmd);
+      $proc = proc_open($cmd, $streams, $pipes);
+
+      if (!is_resource($proc)) {
+        $this->fail("has failed to start [$cmd]");
+      } else {
+        $temp or fwrite($pipes[0], $code);
+        fclose(array_shift($pipes));
+
+        $code = stream_get_contents($pipes[0]);
+        fclose(array_shift($pipes));
+
+        $exitCode = proc_close($proc);
+
+        if ($exitCode != 0 and $paths[$tool][0] !== '@') {
+          $this->fail("has failed to call [$cmd] - exit code $exitCode");
+        }
+      }
+
+      $temp and unlink($temp);
+      return $code;
+    }
   }
 
-  function numFmt($num) {
-    return number_format($num, 0, '.', ' ');
+  function makeTemp($data) {
+    do {
+      $file = $this->name.'-'.time().'-'.mt_rand(0, 999).'.tmp';
+      $file = $this->config->absolute($file, $this->config->tempPath);
+    } while (is_file($file));
+
+    $this->config->writeFile($file, $data);
+    return $file;
+  }
+
+  function loadTool($tool) {
+    $paths = $this->config->libPaths;
+    $jsminLib = $this->config->absolute($paths['jsmin-php'], $this->config->dkiPath);
+
+    if ($tool === 'auto') {
+      if ($this->hasCmd($paths['yuglify'])) {
+        $tool = 'yuglify';
+      } else if ($this->hasCmd($paths['uglifyjs2'])) {
+        $tool = 'uglifyjs2';
+      } else if ($this->hasCmd($paths['uglifyjs'])) {
+        $tool = 'uglifyjs';
+      } elseif (is_file($jsminLib)) {
+        $tool = 'jsmin-php';
+      } else {
+        $this->fail('can detect no known minifier');
+      }
+    }
+
+    if ($tool === 'jsmin-php') {
+      class_exists('JSMin') or include_once $jsminLib;
+      class_exists('JSMin') or $this->fail("cannot load JSMin class from [$file]");
+    } elseif (empty($paths[$tool])) {
+      $this->fail("was specified an unknown tool [$tool]");
+    }
+
+    return $tool;
+  }
+
+  function hasCmd($cmd) {
+    exec(strtok($cmd, ' ').' --help 2>NUL', $output, $code);
+    return $code == 0;
   }
 }
 
@@ -1193,7 +1357,7 @@ class DkiVia extends DeplokiFilter {
 
   function execScript($_file) {
     is_file($_file) or $_file->fail("cannot find script [$file] to execute");
-    $this->log($file);
+    $this->log($_file);
 
     $chain = $this->chain;
     $config = $this->config;
@@ -1274,7 +1438,7 @@ class DkiLink extends DeplokiFilter {
       }
 
       $url = $this->config->urlOf($linker);
-      $chain->urls['link'] = $url.'?'.join('&', $query).'&'.$config->query;
+      $chain->urls[$chain->name] = $url.'?'.join('&', $query).'&'.$config->query;
     }
   }
 }
@@ -1332,6 +1496,7 @@ class DkiHtmlki extends DeplokiRenderingFilter {
     ($kiCfg instanceof HTMLkiConfig) or $this->fail('received $kiCfg of wrong type');
 
     $kiCfg->warning = array($this, 'onWarning');
+    // note that $addLineBreaks will be in effect if a template wasn't precompiled.
     $kiCfg->addLineBreaks = $this->config->debug;
     $kiCfg->xhtml = $this->config->xhtml;
     $kiCfg->language = array($this, 'langLine');
@@ -1402,9 +1567,21 @@ class DkiUwiki extends DeplokiRenderingFilter {
 
   protected function initialize($config) {
     parent::initialize($config);
+
     // 'fsCharset' needs iconv extension.
-    $this->defaults += array('xhtml' => false, 'markup' => 'wiki',
-                             'fsCharset' => null);
+    $this->defaults += array(
+      'xhtml'             => false,
+      'markup'            => 'wiki',
+      'fsCharset'         => null,
+
+      // can be false to inline attachments into generated HTML.
+      'attachments'       => array(
+        // each member can be null to leave alone attachments of that type.
+        '*'               => array(
+          'concat', '?minify', 'write' => '{MEDIAPATH}/{HASH}.{TYPE}',
+        ),
+      ),
+    );
   }
 
   function isLoaded() {
@@ -1441,9 +1618,11 @@ class DkiUwiki extends DeplokiRenderingFilter {
 
   protected function doRender(array $vars, $data) {
     $this->config->fromData or $data = $this->config->readFile($data);
+    $attachments = $this->config->attachments;
 
     $doc = new UWikiDocument($data);
-    $doc->settings = $this->rendererConfig;
+    $doc->settings = clone $this->rendererConfig;
+    $attachments and $doc->MergeAttachmentsOfNestedDocs();
 
     if ($src = dkiPath(dkiGet($vars, 'src')) and
         strpos($src, $base = dkiPath($doc->settings->pager->GetBaseDir()).'/') === 0) {
@@ -1455,8 +1634,30 @@ class DkiUwiki extends DeplokiRenderingFilter {
     $markup = $this->config->markup === 'wiki' ? 'wacko' : $this->config->markup;
     $doc->LoadMarkup($markup);
     $doc->Parse();
+    $html = $doc->ToHTML();
 
-    return $doc->ToHTML();
+    $this->config->addMedia('uwiki.', array('raw' => $doc));
+    // some attachments might become available after document rendering.
+    $attachments and $this->attachments($doc, $attachments);
+
+    return $html;
+  }
+
+  function attachments(UWikiDocument $doc, $modes) {
+    if ($modes) {
+      foreach ($doc->attachments as $type => $list) {
+        $var = "attachments.$type";
+
+        for ($i = 1; $this->config->hasMedia($var); ++$i) {
+          $var = "attachments_$i.$type";
+        }
+
+        $filters = dkiGet($modes, $type, dkiGet($modes, '*'));
+        // spaces are to avoid collision if 'raw' is also used by the user.
+        $filters = array(' raw  ' => array('data' => $list)) + $filters;
+        $this->config->addMedia($var, $filters);
+      }
+    }
   }
 }
 

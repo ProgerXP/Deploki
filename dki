@@ -19,6 +19,11 @@ extract(Deploki::parseCL($argv, $arrays));
 $config = $index ? $index[0] : getcwd();
 $config = DeplokiConfig::loadFrom(DeplokiConfig::locate($config));
 
+if (isset($flags['s']) and isset($flags['d'])) {
+  die('Flags -s and -d conflict with each other.');
+}
+
+isset($flags['s']) and $options += array('debug' => false);
 isset($flags['d']) and $options += array('debug' => true);
 isset($flags['f']) and $config->perFilter['omitold']->condition = false;
 isset($flags['y']) and error_reporting(error_reporting() & ~E_USER_WARNING);
