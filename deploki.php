@@ -76,6 +76,7 @@ class DeplokiConfig {
   public $perFilter;    //= hash of hash, hash of DeplokiConfig
   public $logger;       //= callable ($msg, DeplokiFilter = null)
   public $nestingLevel; //= int depth of current filter chain (> 0)
+  public $mediaParent;  //= null, DeplokiConfig parent if $this is a $mediaVars batch
 
   /*---------------------------------------------------------------------
   | METHODS
@@ -161,6 +162,7 @@ class DeplokiConfig {
     $this->perFilter      = array('' => array());
     $this->logger         = null;
     $this->nestingLevel   = 0;
+    $this->mediaParent    = null;
 
     return $this;
   }
@@ -239,7 +241,7 @@ class DeplokiConfig {
     $vars = array();
 
     foreach ((array) $this as $prop => $value) {
-      is_scalar($value) and $vars[$prop] = $value;
+      if (is_scalar($value) or $value === null) { $vars[$prop] = $value; }
     }
 
     return $vars;
@@ -338,6 +340,7 @@ class DeplokiConfig {
 
       $batchConfig = clone $this;
       $batchConfig->media = array();   // to avoid recursion.
+      $batchConfig->mediaParent = $this;
       $this->media = new DeplokiBatch($batchConfig, $this->media);
       $this->media->cache = true;
     }
@@ -346,8 +349,8 @@ class DeplokiConfig {
 
     foreach ($this->media->process() as $name => $chain) {
       // $name = name[.[ext]]; vars containing the same 'ext' are joined
-      // together; vars without a dot not but their values are joined into
-      // a string; vars ending on '.' are are passed to the template as
+      // together; vars without a dot are not but their values are joined into
+      // a string; vars ending on '.' are passed to the template as
       // is (even if they're not scalar).
       $ext = ltrim(strrchr($name, '.'), '.');
       $values = $chain->urls ? $chain->urls : $chain->data;
@@ -414,6 +417,35 @@ class DeplokiConfig {
     is_int($name) and ++$name;
     return "$$name";
   }
+
+  function fileVars($path, $typeVar, $nameVar, $pathVar = null) {
+    $vars = Deploki::fileVars($path, $typeVar, $nameVar, $pathVar);
+
+    if ($pathVar and
+        strpos($vars[$pathVar], $root = dkiPath($this->inPath).'/') === 0) {
+      $vars[$pathVar] = substr($vars[$pathVar], strlen($root));
+    }
+
+    return $vars;
+  }
+
+  //* $file str - of form 'path\...\file.en[.EXT]' or 'file_en[.EXT]'.
+  //= str 'en', null
+  function langFromFileName($file) {
+    $ext = substr((string) strrchr($file, '.'), 1);
+
+    if (!$ext) {
+      $suffix = substr((string) strrchr($file, '_'), 1);
+
+      if ($suffix and in_array($suffix, $this->languages)) {
+        return $suffix;
+      }
+    } elseif (in_array($ext, $this->languages)) {
+      return $ext;
+    } else {
+      return $this->langFromFileName( substr($file, 0, -strlen($ext) - 1) );
+    }
+  }
 }
 
 /*-----------------------------------------------------------------------
@@ -432,7 +464,7 @@ class Deploki {
   }
 
   static function fileVars($path, $typeVar, $nameVar, $pathVar = null) {
-    $pathVar and $pathVar = array($pathVar => dirname($path));
+    $pathVar and $pathVar = array($pathVar => dkiPath(dirname($path)).'/');
 
     return ((array) $pathVar) + array(
       $typeVar            => $ext = ltrim(strrchr($path, '.'), '.'),
@@ -444,7 +476,7 @@ class Deploki {
   //* $args array - PHP's $argv, list of raw command-line options given by index.
   //* $arrays array - listed keys will be always arrays in returned 'options'.
   //= array with 3 arrays described above (flags, options, index)
-  function parseCL($args, $arrays = array()) {
+  static function parseCL($args, $arrays = array()) {
     $arrays = array_flip($arrays);
     $flags = $options = $index = array();
 
@@ -456,10 +488,14 @@ class Deploki {
             break;
           } elseif ($argValue = ltrim($arg, '-')) {
             if ($arg[1] == '-') {
-              strrchr($argValue, '=') === false and $argValue .= '=';
-              list($key, $value) = explode('=', $argValue, 2);
+              if (strrchr($argValue, '=') === false) {
+                $key = $argValue;
+                $value = true;
+              } else {
+                list($key, $value) = explode('=', $argValue, 2);
+              }
+
               $key = strtolower($key);
-              isset($value) or $value = true;
 
               if (preg_match('/^(.+)\[(.*)\]$/', $key, $matches)) {
                 list(, $key, $subKey) = $matches;
@@ -513,7 +549,7 @@ class Deploki {
       );
     }
 
-    if (defined('STDIN' or !empty($_SERVER['TERM']))) {
+    if (defined('STDIN') or !empty($_SERVER['TERM'])) {
       echo join(PHP_EOL, array_map('strip_tags', $msg)), PHP_EOL;
     } else {
       echo join("\n", $msg);
@@ -611,7 +647,9 @@ class DeplokiBatch {
     $logger = $this->config->loggeræ;
 
     foreach ($this->chains as $key => $chain) {
-      if ($this->cache and isset($this->cached[$key])) {
+      $cachable = ($this->cache and $chain->cache);
+
+      if ($cachable and isset($this->cached[$key])) {
         $result[$key] = clone $this->cached[$key];
       } else {
         if ($logger and (count($chain) != 1 or $chain[0]->name != 'raw')) {
@@ -620,7 +658,7 @@ class DeplokiBatch {
 
         $chain = clone $chain;
         $result[$key] = $chain->execute();
-        $this->cache and $this->cached[$key] = clone $chain;
+        $cachable and $this->cached[$key] = clone $chain;
       }
     }
 
@@ -643,6 +681,7 @@ class DeplokiChain {
   public $config;             //= DeplokiConfig
   public $filters = array();  //= array of DeplokiFilter
 
+  public $cache = true;       //= bool see DeplokiBatch->process()
   public $name;               //= null, string
   public $data;               //= array of string
   public $urls;               //= array of string
@@ -669,6 +708,12 @@ class DeplokiChain {
 
     $this->name = $name;
     $this->filters = $this->parse($filters);
+
+    if (isset( $this->filters['cache'] )) {
+      $this->cache = !!$this->filters['cache'];
+      unset( $this->filters['cache'] );
+    }
+
     $this->reset();
   }
 
@@ -677,7 +722,7 @@ class DeplokiChain {
     is_array($filters) or $filters = array($filters);
 
     foreach ($filters as $filter => &$options) {
-      if (! $options instanceof DeplokiFilter) {
+      if (! $options instanceof DeplokiFilter and $filter !== 'cache') {
         if (is_int($filter)) {
           if (is_string($options)) {
             $filter = $options;
@@ -843,14 +888,18 @@ abstract class DeplokiMinifyingFilter extends DeplokiFilter {
   protected abstract function doMinify($code, $config);
 
   function numFmt($num) {
-    return number_format($num, 0, '.', ' ');
+    $sign = $num > 0 ? '+' : '';    // minus is output by number_format().
+    return $sign.number_format($num, 0, '.', ' ');
   }
 }
 
 // Renderers are filters that transform one markup into another (e.g. wiki to HTML).
 abstract class DeplokiRenderingFilter extends DeplokiFilter {
   // 'configurator' is a function ($config, DeplokiFilter); if returns non-null value
-  // it's used instead of passed $config.
+  // it's used instead of passed $config. 'perLanguages' can be array, string (single
+  // language), null/false (language-independent rendering), 'all' for configured
+  // languages or true to autodetect (same as 'all' unless source file has '_en.EXT'
+  // suffix in its name, e.g. 'index_en.html').
   public $defaults = array('fromData' => true, 'compact' => null,
                            'configurator' => null, 'vars' => array(),
                            'perLanguages' => true, 'withMedia' => true);
@@ -899,22 +948,40 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
   //= string transformed data
   //= hash 'suffix' => 'data' - multiple new data (e.g. per language)replacing old
   function render($data, $src = null) {
-    $result = array();
-    $media = $this->config->withMedia ? $this->config->mediaVars() : array();
-
     $languages = $this->config->perLanguages;
+
     if (!is_array($languages) and !is_string($languages)) {
-      $languages = $languages ? $this->config->languages : array(null);
+      if (!$languages) {
+        $languages = array(null);
+      } elseif ($languages !== 'all' and $lang = $this->config->langFromFileName($src)) {
+        $languages = array($lang);
+      } else {
+        $languages = $this->config->languages;
+      }
     }
 
     $languages = (array) $languages;
     $languages or $this->warn('is given an empty language list to render into');
 
+    $result = array();
+
     foreach ($languages as $language) {
       $this->currentLang = $language;
 
-      $vars = $this->config->vars + compact('languages', 'language', 'src') +
-              $media + $this->config->vars();
+      // processing media within the loop because (1) there might be uncachable
+      // chains ('cache' => false, often used along with 'via'), (2) some chains
+      // might depend on current language.
+      if ($this->config->withMedia) {
+        foreach (compact('languages.', 'language', 'src') as $var => $raw) {
+          $this->config->addMedia($var, compact('raw'));
+        }
+
+        $media = $this->config->mediaVars();
+      } else {
+        $media = array();
+      }
+
+      $vars = $this->config->vars + $media + $this->config->vars();
 
       $rendered = $this->doRender($vars, $data);
       if ($on = $this->config->compact or ($on === null and !$this->config->debug)) {
@@ -1008,19 +1075,22 @@ class DkiRead extends DeplokiFilter {
     $files = array_unique($files);
 
     // note that all items in $files exist thanks to glob().
-    foreach ($files as $path) { $chain->data[$path] = $this->read($path); }
+    foreach ($files as $path) {
+      list($data, $src) = $this->read($path);
+      $chain->data[$src] = $data;
+    }
   }
 
   function read($file) {
     $this->log($file);
-    return $this->config->readFile($file);
+    return array($this->config->readFile($file), $file);
   }
 }
 
 // The same as READ but also formats the data as if {EXT} filter was applied to it.
 class DkiReadfmt extends DkiRead {
   function read($file) {
-    $data = parent::read($file);
+    list($data) = parent::read($file);
     $ext = ltrim(strrchr($file, '.'), '.');
 
     if ($ext) {
@@ -1028,7 +1098,7 @@ class DkiReadfmt extends DkiRead {
                                               $this->chain->name.".$ext"));
     }
 
-    return $data;
+    return array($data, $file);
   }
 }
 
@@ -1042,12 +1112,10 @@ class DkiWrite extends DeplokiFilter {
 
   protected function doExecute($chain, $config) {
     foreach ($chain->data as $src => &$data) {
-      $vars = Deploki::fileVars($src, 'ext', 'file', 'path') + compact('src');
+      $vars = $this->config->fileVars($src, 'ext', 'file', 'path') + compact('src');
 
-      $lang = (string) strrchr($src, '_');
-      if (in_array($lang = substr($lang, 1), $this->config->languages)) {
-        $vars['lang'] = $lang;
-      }
+      $lang = substr((string) strrchr($src, '_'), 1);
+      $vars['lang'] = in_array($lang, $this->config->languages) ? $lang : null;
 
       $dest = $config->dest;
       $dest or $dest = $config->default;
@@ -1118,8 +1186,11 @@ class DkiConcat extends DeplokiFilter {
   // 'title' can be null (detect <hX> in data) or an (empty) string (title).
   // If 'cutTitle' is true <hX>...</hX> will be removed from the data. If it's
   // false/null it's be kept. If it's a string it's replaced with that string instead.
+  // 'callSetup' is callable (string &$data, DeplokiConfig, DkiConcat)
+  // 'callResult' is callable (array &$data, DeplokiConfig, DkiConcat)
   public $defaults = array('glue' => "\n", 'cacheChain' => false, 'title' => null,
-                           'cutTitle' => false);
+                           'cutTitle' => false,
+                           'callSetup' => null, 'callResult' => null);
   public $shortOption = 'chains';
 
   // Private fields for cutHeading() to overcome the absense of PHP 5.3 closures.
@@ -1157,23 +1228,41 @@ class DkiConcat extends DeplokiFilter {
           $merged .= $cached[$name];
         } else {
           $chainConfig = clone $this->config;
-          $chainConfig->override(Deploki::fileVars($src, 'catExt', 'catFile', 'catPath'));
+          $chainConfig->override($this->config->fileVars($src, 'catExt', 'catFile', 'catPath'));
+
+          foreach (dkiArray($this->config->callSetup) as $func) {
+            $func and call_user_func_array($func, array(&$data, $chainConfig, $this));
+          }
 
           if (!$this->config->cacheChain) {
             if (!isset($title)) {
               $replace = $this->config->cutTitle ? '' : null;
               $title = $this->cutHeading($data, $replace);
-              $title = $title ? strip_tags(trim($title[2])) : '';
+
+              if ($title) {
+                $title = strip_tags(trim($title[2]));
+                $title = html_entity_decode($title, ENT_QUOTES, 'utf-8');
+              } else {
+                $title = '';
+              }
             }
 
             $vars = array('body' => $data, 'title' => $title);
 
             foreach ($vars as $name => &$value) {
-              $chainConfig->addMedia($name, array('raw' => $value));
+              if (!$chainConfig->hasMedia($name)) {
+                $chainConfig->addMedia($name, array('raw' => $value));
+              }
             }
           }
 
-          $result = join(DeplokiChain::execGetData($chainConfig, $chain, $name));
+          $result = DeplokiChain::execGetData($chainConfig, $chain, $name);
+
+          foreach (dkiArray($this->config->callResult) as $func) {
+            $func and call_user_func_array($func, array(&$result, $chainConfig, $this));
+          }
+
+          $result = join($result);
           $this->config->cacheChain and $cached[$name] = $result;
           $merged .= $result;
         }
@@ -1331,6 +1420,80 @@ class DkiMinifyjs extends DeplokiMinifyingFilter {
   }
 }
 
+// Normalizes line breaks and indentation in HTML code.
+class DkiPrettyhtml extends DeplokiMinifyingFilter {
+  public $defaults = array('rawTags' => array('textarea', 'pre', 'code'),
+                           'blockTags' =>
+    'article aside blockquote body colgroup datalist details dialog div dl fieldset
+     figure footer form head header hgroup html li map menu nav noscript object ol
+     optgroup output p pre samp section select source style table tbody td
+     tfoot th thead tr ul'
+  );
+
+  protected function doMinify($code, $config) {
+    $raw = array();
+
+    $addRaw = function ($match) use (&$raw) {
+      $key = "\5".count($raw)."\7";
+      $raw[$key] = $match[0];
+      return $key;
+    };
+
+    $regexp = '~<\s*('.join('|', $config->rawTags).')\b[^>]*>[^<]*</\s*\1\s*>~';
+    $code = preg_replace_callback($regexp, $addRaw, $code);
+
+    if (preg_last_error() != 0) {
+      $this->fail('can\'t run preg_replace() - make sure that HTML is encoded in UTF-8');
+    }
+
+    $result = '';
+    $level = 0;
+    $lastEmpty = $lastBlock = true;
+
+    $blockRegExp = join('|', array_filter(explode(' ', $config->blockTags)));
+    $blockRegExp = '~<(/?)\s*(?:'.$blockRegExp.')\b~i';
+
+    foreach (explode("\n", $code) as $line) {
+      $line = trim($line);
+
+      if ($line !== '') {
+        $levelChange = 0;
+
+        if (preg_match_all($blockRegExp, $line, $matches)) {
+          foreach ($matches[1] as $match) { $levelChange += $match ? -1 : +1; }
+        }
+
+        $levelChange < 0 and $level = max(0, $level + $levelChange);
+        $line = str_repeat('  ', $level).trim($line)."\n";
+
+        if ($levelChange > 0) {
+          // adding blank line before <block> tag opening.
+          if (!$lastEmpty and !$lastBlock and strpos($line, '<html') === false) {
+            $line = "\n$line";
+          }
+
+          $level += $levelChange;
+        } elseif ($levelChange < 0 and $lastEmpty and
+                  ltrim($line, " </a..zA..Z>\r\n") === '') {
+          // removing blank lines before </block> tag closings.
+          $result = substr($result, 0, -1);
+        }
+
+        $lastBlock = $levelChange > 0;
+        $lastEmpty = false;
+      } elseif (!$lastEmpty) {
+        // collapsing blank lines to no more than one.
+        $lastEmpty = true;
+        $line = "\n";
+      }
+
+      $result .= $line;
+    }
+
+    return trim(strtr($result, $raw));
+  }
+}
+
 // Fixes url(...) paths in CSS - useful when storing joined/minified styles elsewhere.
 class DkiCssurl extends DeplokiFilter {
   public $defaults = array('url' => '../');
@@ -1483,7 +1646,7 @@ class DkiVersion extends DeplokiFilter {
 class DkiHtmlki extends DeplokiRenderingFilter {
   protected function initialize($config) {
     parent::initialize($config);
-    $this->defaults += array('xhtml' => false);
+    $this->defaults += array('xhtml' => false, 'ki' => array());
   }
 
   function isLoaded() {
@@ -1501,6 +1664,10 @@ class DkiHtmlki extends DeplokiRenderingFilter {
     $kiCfg->xhtml = $this->config->xhtml;
     $kiCfg->language = array($this, 'langLine');
     $kiCfg->template = array($this, 'onInclude');
+
+    foreach ($this->config->ki as $name => $value) {
+      $kiCfg->$name = $value;
+    }
 
     return $kiCfg;
   }
