@@ -197,7 +197,7 @@ class DeplokiConfig {
 
   function override(array $override) {
     foreach ($override as $name => $value) {
-      "$name" !== '' and $this->$name = $value;
+      "$name" === '' or $this->$name = $value;
     }
 
     return $this;
@@ -340,12 +340,16 @@ class DeplokiConfig {
 
       $batchConfig = clone $this;
       $batchConfig->media = array();   // to avoid recursion.
-      $batchConfig->mediaParent = $this;
+
+      $parent = $this;
+      $batchConfig->mediaParent = &$parent;
+
       $this->media = new DeplokiBatch($batchConfig, $this->media);
       $this->media->cache = true;
     }
 
     $result = array();
+    $this->media->config->mediaParent = $this;
 
     foreach ($this->media->process() as $name => $chain) {
       // $name = name[.[ext]]; vars containing the same 'ext' are joined
@@ -709,9 +713,9 @@ class DeplokiChain {
     $this->name = $name;
     $this->filters = $this->parse($filters);
 
-    if (isset( $this->filters['cache'] )) {
-      $this->cache = !!$this->filters['cache'];
-      unset( $this->filters['cache'] );
+    if (isset( $this->filters['!cache'] )) {
+      $this->cache = !!$this->filters['!cache'];
+      unset( $this->filters['!cache'] );
     }
 
     $this->reset();
@@ -722,7 +726,7 @@ class DeplokiChain {
     is_array($filters) or $filters = array($filters);
 
     foreach ($filters as $filter => &$options) {
-      if (! $options instanceof DeplokiFilter and $filter !== 'cache') {
+      if (! $options instanceof DeplokiFilter and $filter !== '!cache') {
         if (is_int($filter)) {
           if (is_string($options)) {
             $filter = $options;
@@ -969,7 +973,7 @@ abstract class DeplokiRenderingFilter extends DeplokiFilter {
       $this->currentLang = $language;
 
       // processing media within the loop because (1) there might be uncachable
-      // chains ('cache' => false, often used along with 'via'), (2) some chains
+      // chains ('!cache' => false, often used along with 'via'), (2) some chains
       // might depend on current language.
       if ($this->config->withMedia) {
         foreach (compact('languages.', 'language', 'src') as $var => $raw) {
@@ -1047,7 +1051,9 @@ class DkiRaw extends DeplokiFilter {
   public $shortOption = 'data';
 
   protected function doExecute($chain, $config) {
-    $chain->data = dkiArray($config->data) + $chain->data;
+    $data = $config->data;
+    $data instanceof Closure and $data = $data($chain, $config);
+    $chain->data = dkiArray($data) + $chain->data;
   }
 }
 
@@ -1228,7 +1234,18 @@ class DkiConcat extends DeplokiFilter {
           $merged .= $cached[$name];
         } else {
           $chainConfig = clone $this->config;
-          $chainConfig->override($this->config->fileVars($src, 'catExt', 'catFile', 'catPath'));
+
+          $fileVars = $this->config->fileVars($src, 'catExt', 'catFile', 'catPath');
+          $chainConfig->override($fileVars + array('catSrc' => $src));
+
+          // Preventing generation of multilanguage templates for the single source.
+          // Consider $chain = array('readfmt' => '_template.html'); when deploying
+          // for multiple languages _template.html will be rendered for each of them
+          // (provided default 'perLanguages' value is true or array of several langs).
+          // Thus $result below will be array('source..._en' => '...', '..._ru' => ...),
+          // which will be join()'ed creating the repetitive string.
+          $perLanguages = array( substr((string) strrchr($src, '_'), 1) );
+          $chainConfig->perFilter['']['perLanguages'] = $perLanguages;
 
           foreach (dkiArray($this->config->callSetup) as $func) {
             $func and call_user_func_array($func, array(&$data, $chainConfig, $this));
@@ -1249,9 +1266,9 @@ class DkiConcat extends DeplokiFilter {
 
             $vars = array('body' => $data, 'title' => $title);
 
-            foreach ($vars as $name => &$value) {
-              if (!$chainConfig->hasMedia($name)) {
-                $chainConfig->addMedia($name, array('raw' => $value));
+            foreach ($vars as $var => &$value) {
+              if (!$chainConfig->hasMedia($var)) {
+                $chainConfig->addMedia($var, array('raw' => $value));
               }
             }
           }
@@ -1315,7 +1332,7 @@ class DkiMinifycss extends DeplokiMinifyingFilter {
 
     $hex = '([a-zA-Z0-9])';
     $path = '[a-zA-Z0-9_\-.\#,*>+\s\[\]=\~\|:\(\)]';
-    $regexp = '/\*.*?\*/ | '.$path.'{1,50} \s*\{\s*}\s* | \s*([;:{,}])\s+ | ;\s*(})\s* | '.
+    $regexp = '/\*(?!!).*?\*/ | '.$path.'{1,50} \s*\{\s*}\s* | \s*([;:{,}])\s+ | ;\s*(})\s* | '.
               "\\b(?<!-)0(\.\d) | (\#) $hex\\5$hex\\6$hex\\7 | \s+([+>,])\s+";
 
     return trim(preg_replace("~$regexp~x", '\1\2\3\4\5\6\7\8', $code));
