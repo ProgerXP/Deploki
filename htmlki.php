@@ -1,5 +1,15 @@
 <?php
-/* HTMLki - part of the Squizzle PHP Library | http://squizzle.me | $Revision: 87 $ */
+/*
+  HTMLki - seamless templating with the HTML spirit
+  in public domain | by Proger_XP
+  http://proger.i-forge.net/HTMLki/SZS
+
+ *** Supports PHP 5.2 and up ***
+
+  Instruction for getting HTMLki work with pre-5.3:
+  1. Replace all '?:' operators with expanded '? <value> :' form.
+  2. Replace all 'static' words with 'self'. In instance methods '$this' can be used.
+*/
 
 HTMLki::$config = new HTMLkiConfig;
 
@@ -365,8 +375,8 @@ class HTMLkiTagCall {
 
     $result = $config->defaultsOf($this->tag);
 
-    $values = $this->values;
-    foreach ($values as &$value) { $value = $value[1]; }
+    $values = $this->tpl->evaluateWrapped($this->vars, $this->values);
+    foreach ($values as &$value) { $value = array_pop($value); }
 
     foreach ($this->defaults as $str) {
       $default = array_shift($defaults);
@@ -659,7 +669,9 @@ class HTMLkiTemplate extends HTMLkiObject
   }
 
   protected function placeholders(array $values) {
-    return array_map(function ($i) { return ":$i"; }, range(1, count($values)));
+    $result = range(1, count($values));
+    foreach ($result as &$i) { $i = ":$i"; }
+    return $result;
   }
 
   // * $params string
@@ -698,7 +710,7 @@ class HTMLkiTemplate extends HTMLkiObject
     if ($params !== '') {
       $name = HTMLkiCompiler::wrappedRegExp();
       $regexp = "~(\s|^)
-                    (?: ($name|[^\s=]+) =)? ($name|[^\s]+)
+                    (?: ($name|[^\s=]*) =)? ($name|[^\s]+)
                   (?=\s|$)~x".$this->config->regexpMode;
 
       if (!preg_match_all($regexp, $params, $matches, PREG_SET_ORDER)) {
@@ -926,19 +938,8 @@ class HTMLkiTemplate extends HTMLkiObject
     if ($call->isSingle) {
       // <... />
       if ($call->lists) {
-        $self = $this;
-        $this->loop($call, function ($vars) use ($self, $call) {
-          $call = clone $call;
-
-          foreach ($call->defaults as &$s) {
-            $s = $self->evaluateWrapped($vars, '', $s);
-          }
-
-          $call->attributes = $self->evaluateWrapped($vars, $call->attributes);
-          $call->values = $self->evaluateWrapped($vars, $call->values);
-
-          echo $self->htmlTagOf($call, $call->tag);
-        });
+        $this->regularTagSingleLoopCall = $call;
+        $this->loop($call, array($this, 'regularTagSingleLoop'));
       } else {
         $call->attributes = $this->evaluateWrapped($call->vars, $call->attributes);
         $call->values = $this->evaluateWrapped($call->vars, $call->values);
@@ -954,17 +955,17 @@ class HTMLkiTemplate extends HTMLkiObject
 
       echo "</$tag>";
     } elseif ($call->lists) {  // <...>
-      $result = array();
-      $this->loop($call, function ($vars) use (&$result) { $result[] = $vars; });
+      $this->regularTagListsLoopResult = array();
+      $this->loop($call, array($this, 'regularTagListsLoop'));
 
-      if ($result) {
+      if ($this->regularTagListsLoopResult) {
         $call->attributes = $this->evaluateWrapped($call->vars, $call->attributes);
         $call->values = $this->evaluateWrapped($call->vars, $call->values);
 
         echo $this->htmlTagOf($call, $tag);
       }
 
-      return $result;
+      return $this->regularTagListsLoopResult;
     } else {
       $call->attributes = $this->evaluateWrapped($call->vars, $call->attributes);
       $call->values = $this->evaluateWrapped($call->vars, $call->values);
@@ -996,7 +997,7 @@ class HTMLkiTemplate extends HTMLkiObject
           }
         }
 
-        $callback($vars);
+        call_user_func($callback, $vars);
       }
     }
   }
@@ -1081,11 +1082,9 @@ class HTMLkiTemplate extends HTMLkiObject
       $this->warning("Cannot <include> a template - no name given.");
     } else {
       $values = $this->evaluateWrapped($call->vars, $call->values);
-      $file = call_user_func($func, $call->values[0][1], $this, $call);
+      $tpl = $file = call_user_func($func, $call->values[0][1], $this, $call);
 
-      if ($file instanceof self) {
-        $tpl = $file;
-      } elseif (is_string($file)) {
+      if (is_string($tpl)) {
         $config = $this->config->inheritConfig ? 'config' : 'originalConfig';
 
         $tpl = new static($this->$config());
@@ -1094,10 +1093,8 @@ class HTMLkiTemplate extends HTMLkiObject
       }
 
       if ($call->lists) {
-        $this->loop($call, function ($vars) use ($tpl) {
-          $tpl->add($vars);
-          echo $tpl->render();
-        });
+        $this->tag_includeTpl = $tpl;
+        $this->loop($call, array($this, 'tag_includeLoop'));
       } else {
         echo $tpl->render();
       }
@@ -1107,13 +1104,9 @@ class HTMLkiTemplate extends HTMLkiObject
   protected function tag_each($call) {
     if (!$call->isEnd) {
       if ($call->lists) {
-        $result = array();
-
-        $this->loop($call, function ($vars) use (&$result) {
-          $result[] = $vars;
-        });
-
-        return $result;
+        $this->tag_eachLoopResult = array();
+        $this->loop($call, array($this, 'tag_eachLoop'));
+        return $this->tag_eachLoopResult;
       } else {
         $this->warning('<each> called without list name.');
       }
@@ -1131,7 +1124,9 @@ class HTMLkiTemplate extends HTMLkiObject
     $vars = $call->vars + $this->evaluateWrapped($call->vars, $call->attributes);
 
     foreach ($call->defaults as $lang) {
-      if ($values = $call->values) {
+      $values = $this->evaluateWrapped($call->vars, $call->values);
+
+      if ($values) {
         foreach ($values as &$value) { $value = array_pop($value); }
         $values = array_combine($this->placeholders($values), $values);
       }
@@ -1149,6 +1144,48 @@ class HTMLkiTemplate extends HTMLkiObject
 
       if ($call->isSingle) { echo $this->email($email), '</a>'; }
     }
+  }
+
+  /*-----------------------------------------------------------------------
+  | PHP 5.2 SUPPORT - closureless callbacks
+  |----------------------------------------------------------------------*/
+
+  // for regularTag()
+  protected $regularTagSingleLoopCall;
+  function regularTagSingleLoop($vars)  {
+    $call = clone $this->regularTagSingleLoopCall;
+    // unlike other loop calbacks <single $list /> doesn't return to the view
+    // where extract() adds iteration variables to common pool; this means we
+    // should add already defined variables in the template's scope manually:
+    $vars += $call->vars;
+
+    foreach ($call->defaults as &$s) {
+      $s = $this->evaluateWrapped($vars, '', $s);
+    }
+
+    $call->attributes = $this->evaluateWrapped($vars, $call->attributes);
+    $call->values = $this->evaluateWrapped($vars, $call->values);
+
+    echo $this->htmlTagOf($call, $call->tag);
+  }
+
+  // for regularTag()
+  protected $regularTagListsLoopResult;
+  function regularTagListsLoop($vars) {
+    $this->regularTagListsLoopResult[] = $vars;
+  }
+
+  // for tag_include()
+  protected $tag_includeTpl;
+  function tag_includeLoop($vars) {
+    $this->tag_includeTpl->add($vars);
+    echo $this->tag_includeTpl->render();
+  }
+
+  // for tag_each()
+  protected $tag_eachLoopResult;
+  function tag_eachLoop($vars) {
+    $this->tag_eachLoopResult[] = $vars;
   }
 }
 
@@ -1187,6 +1224,7 @@ class HTMLkiCompiler extends HTMLkiObject {
   static function wrappedRegExp() {
     return static::quotedRegExp().'|\{[^}\r\n]+}';
   }
+
   function __construct(HTMLkiConfig $config, $str) {
     $this->config = $config;
     $this->str = $str;
@@ -1224,9 +1262,13 @@ class HTMLkiCompiler extends HTMLkiObject {
     $str = strtr($str, $this->raw);
 
     if ($this->config->addLineBreaks) {
-      $feeds = array("?>\n" => ";echo \"\\n\"?>\n",
-                     "?>\r\n" => ";echo \"\\r\n\"?>\r\n");
-      $str = strtr($str, $feeds);
+      $replacer = function ($match) {
+        list(, $code, $ending, $eoln) = $match;
+        return $code.'; echo "'.addcslashes($eoln, "\r\n").'"'.$ending.$eoln;
+      };
+
+      $regexp = '~^(.+(?:Tag|>lang)\(.+?)(\?>)(\r?\n)~m'.$this->config->regexpMode;
+      $str = preg_replace_callback($regexp, $replacer, $str);
     }
 
     return $this->config->compiledHeader.$str.$this->config->compiledFooter;
@@ -1300,7 +1342,7 @@ class HTMLkiCompiler extends HTMLkiObject {
   protected function compile_varSet(&$str) {
     $ws = '[ \t]';
     $id = '[a-zA-Z_]\w*';
-    $regexp = "~^($ws*\\$)(\\$*)(([=^*])($id)(@(?:$id)?)?($ws+.*)?)$()~m";
+    $regexp = "~^($ws*\\$)(\\$*)(([=^*])($id)(@(?:$id)?)?($ws+.*)?)(?:\r?\n|$)()~m";
 
     return $this->replacing(__FUNCTION__, $regexp, $str);
   }
@@ -1451,7 +1493,8 @@ class HTMLkiCompiler extends HTMLkiObject {
 
         $code = trim( substr($match[1], 0, -1) );
 
-        if (ltrim($code, 'a..zA..Z0..9_') === '' and ltrim($code[0], 'a..z_') === '') {
+        if ($code !== '' and ltrim($code, 'a..zA..Z0..9_') === '' and
+            ltrim($code[0], 'a..z_') === '') {
           $code = "$$code";
         }
 
